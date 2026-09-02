@@ -23,7 +23,7 @@ import requests
 # Configuration
 # ---------------------------------------------------------------------------
 
-SARVAM_API_KEY: str = "YOUR_SARVAM_API_KEY"  # <-- replace with your key
+SARVAM_API_KEY: str = "sk_4r5w9e4b_I7ApxAGis80e61wGOlocjL0H"  # <-- replace with your key
 
 STT_URL = "https://api.sarvam.ai/speech-to-text"
 TTS_URL = "https://api.sarvam.ai/text-to-speech"
@@ -64,7 +64,7 @@ def speech_to_text(audio_file_path: str, language_code: str = "te-IN") -> str:
             "file": (os.path.basename(audio_file_path), audio_file, "audio/wav"),
         }
         data = {
-            "model": "saaras:v2",
+            "model": "saaras:v4",  # latest stable STT model
             "language_code": language_code,
         }
 
@@ -132,13 +132,12 @@ def text_to_speech(
     body = {
         "inputs": [text],
         "target_language_code": language_code,
-        "speaker": "meera",
-        "model": "bulbul:v1",
+        "speaker": "aditya",       # present in both the global and v3 speaker lists
+        "model": "bulbul:v3",      # current TTS model (v2 deprecated)
         "speech_sample_rate": 8000,    # 8 kHz — telephony standard, matches Exotel
         "enable_preprocessing": True,  # normalise numbers, abbreviations, etc.
-        "pitch": 0,                    # neutral pitch (range: -0.75 to 0.75)
         "pace": 1.0,                   # normal speed
-        "loudness": 1.0,               # normal loudness
+        # Note: pitch and loudness are not supported by bulbul:v3
     }
 
     print(f"[TTS] Synthesising speech for language '{language_code}' ...")
@@ -185,7 +184,56 @@ def text_to_speech(
 # Main execution block
 # ---------------------------------------------------------------------------
 
+def _find_recording() -> str:
+    """
+    Auto-discover a WAV file to use as STT input.
+
+    Search order:
+      1. recordings/ folder relative to this script (picks the largest file)
+      2. Current working directory *.wav files (picks the largest)
+      3. Exits with a helpful error message if nothing is found.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    recordings_dir = os.path.join(script_dir, "recordings")
+
+    candidates: list[tuple[int, str]] = []  # (size_bytes, path)
+
+    # Search recordings/ folder
+    if os.path.isdir(recordings_dir):
+        for name in os.listdir(recordings_dir):
+            if name.lower().endswith(".wav"):
+                full_path = os.path.join(recordings_dir, name)
+                candidates.append((os.path.getsize(full_path), full_path))
+
+    # Fallback: any .wav in the current working directory
+    if not candidates:
+        for name in os.listdir("."):
+            if name.lower().endswith(".wav"):
+                candidates.append((os.path.getsize(name), os.path.abspath(name)))
+
+    if not candidates:
+        print(
+            "[ERROR] No WAV files found.\n"
+            "        Expected: recordings/*.wav  (created automatically by the\n"
+            "        Exotel stream endpoint), or any *.wav in the current directory."
+        )
+        sys.exit(1)
+
+    # Largest file = most audio content = best STT test.
+    candidates.sort(reverse=True)
+    chosen = candidates[0][1]
+    print(f"[INFO]  Found {len(candidates)} WAV file(s) in recordings/.")
+    print(f"[INFO]  Using: {chosen}  ({candidates[0][0]:,} bytes)")
+    return chosen
+
+
 if __name__ == "__main__":
+    # ------------------------------------------------------------------
+    # Fix Windows console encoding so Telugu/Unicode text prints correctly.
+    # ------------------------------------------------------------------
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     # ------------------------------------------------------------------
     # Configuration check — warn early if the placeholder key is still set.
     # ------------------------------------------------------------------
@@ -197,17 +245,15 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # ------------------------------------------------------------------
+    # Auto-discover input recording
+    # ------------------------------------------------------------------
+    input_audio_path = _find_recording()
+
+    # ------------------------------------------------------------------
     # Step 1: Speech-to-Text
     # ------------------------------------------------------------------
-    input_audio_path = "test_input.wav"
 
-    if not os.path.isfile(input_audio_path):
-        print(
-            f"[ERROR] Input audio file '{input_audio_path}' not found.\n"
-            f"        Place a WAV file named 'test_input.wav' next to this script."
-        )
-        sys.exit(1)
-
+    print()
     print("=" * 60)
     print(" STEP 1 — Speech-to-Text")
     print("=" * 60)
@@ -238,7 +284,11 @@ if __name__ == "__main__":
     print(" STEP 2 — Text-to-Speech")
     print("=" * 60)
 
-    output_path = "output_response.wav"
+    # Save the TTS output next to the source recording for easy comparison.
+    output_path = os.path.join(
+        os.path.dirname(input_audio_path),
+        "sarvam_tts_response.wav",
+    )
 
     try:
         audio_bytes = text_to_speech(
