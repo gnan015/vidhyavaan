@@ -1,0 +1,14 @@
+{
+  "call_sid": "fa0e96d45db509c4826f0edf23db1a92",
+  "audio_file": "call_fa0e96d45db509c4826f0edf23db1a92.wav",
+  "detected_language": "te-IN",
+  "original_transcript": "హలో, ఎలా ఉన్నారు? ఏం చేస్తున్నారు? మీ నేమ్ ఏంటి? ఇప్పుడు నాకు ఒక డౌట్ ఉంది, అది మీరే క్లారిఫై చేయాలి.",
+  "english_script": "Hello, how are you? What are you doing? What is your name? I have a doubt now, you should clarify it.",
+  "created_at": "2026-09-02T16:50:37.822149+00:00",
+  "status": "completed",
+  "language_probability": 0.958,
+  "sarvam_request_ids": {
+    "transcribe": "20260902_5c1fa772-4bda-41c4-a002-338b67408198",
+    "translate": "20260902_bc337e88-0925-4dc6-bf4a-f023be08af46"
+  }
+}

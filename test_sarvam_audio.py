@@ -132,7 +132,7 @@ def text_to_speech(
     body = {
         "inputs": [text],
         "target_language_code": language_code,
-        "speaker": "aditya",       # present in both the global and v3 speaker lists
+        "speaker": "priya",        # female Bulbul v3 voice
         "model": "bulbul:v3",      # current TTS model (v2 deprecated)
         "speech_sample_rate": 8000,    # 8 kHz — telephony standard, matches Exotel
         "enable_preprocessing": True,  # normalise numbers, abbreviations, etc.

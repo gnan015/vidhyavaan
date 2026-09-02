@@ -1,16 +1,19 @@
 import asyncio
 import base64
 import binascii
+import io
 import json
 import logging
 import os
 import re
 import struct
+import time
 import wave
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, status
 from pydantic import ValidationError
 
@@ -18,7 +21,12 @@ from app.core.config import Settings, get_settings
 from app.schemas.exotel import AudioFrameInfo, ExotelCallback
 from app.services.audio import process_audio_frame
 from app.services.recordings import download_and_process_recording, validate_recording_url
-from app.services.sarvam import transcribe_and_translate_audio
+from app.services.sarvam import (
+    synthesize_english_speech,
+    transcribe_and_translate_audio,
+    translate_wav_bytes,
+    tts_wav_to_pcm16,
+)
 from app.services.security import verify_exotel_request
 
 router = APIRouter(tags=["exotel"])
@@ -138,6 +146,48 @@ def _smooth_and_normalize_pcm(audio: bytes, sample_rate: int, sample_width: int)
     return struct.pack(f"<{len(output)}h", *output)
 
 
+def _pcm_rms(audio: bytes) -> float:
+    """Return RMS energy for a little-endian PCM16 chunk without audioop."""
+    usable_length = len(audio) - (len(audio) % 2)
+    if not usable_length:
+        return 0.0
+    samples = struct.iter_unpack("<h", audio[:usable_length])
+    squared_sum = 0
+    count = 0
+    for (sample,) in samples:
+        squared_sum += sample * sample
+        count += 1
+    return (squared_sum / count) ** 0.5 if count else 0.0
+
+
+def _pcm_to_wav_bytes(audio: bytes, sample_rate: int) -> bytes:
+    """Wrap Exotel PCM16 in a WAV container for Sarvam's multipart API."""
+    stream = io.BytesIO()
+    with wave.open(stream, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio)
+    return stream.getvalue()
+
+
+async def _stream_pcm_to_exotel(
+    websocket: WebSocket, stream_sid: str, audio: bytes, sample_rate: int
+) -> None:
+    """Send 100 ms PCM16 media frames at approximately real-time pace."""
+    frame_size = sample_rate * 2 // 10
+    for offset in range(0, len(audio), frame_size):
+        chunk = audio[offset : offset + frame_size]
+        await websocket.send_json(
+            {
+                "event": "media",
+                "stream_sid": stream_sid,
+                "media": {"payload": base64.b64encode(chunk).decode("ascii")},
+            }
+        )
+        await asyncio.sleep(0.09)
+
+
 async def callback_payload(request: Request) -> dict[str, Any]:
     if request.method == "GET":
         return dict(request.query_params)
@@ -186,6 +236,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
     sample_width = 2
     encoding = "audio/x-raw"
     pcm_buffer = bytearray()
+    audio_frames = bytearray()
     audio_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
     media_chunk_count = 0
     frames_received = 0
@@ -193,10 +244,55 @@ async def exotel_stream(websocket: WebSocket) -> None:
     sequence_gaps = 0
     last_sequence: int | None = None
     last_chunk_size = 0
+    speech_active = False
+    last_speech_time: float | None = None
+    is_processing = False
+    utterance_task: asyncio.Task[None] | None = None
+
+    async def process_utterance(captured_audio: bytes) -> None:
+        """Translate one paused utterance and play its Sarvam TTS response."""
+        nonlocal speech_active, last_speech_time, is_processing, utterance_task
+        try:
+            if not stream_sid:
+                logger.warning(
+                    "loopback_skipped_without_stream_sid",
+                    extra={"call_sid": call_sid, "event": "loopback"},
+                )
+                return
+            english_text = await translate_wav_bytes(
+                _pcm_to_wav_bytes(captured_audio, sample_rate)
+            )
+            if not english_text:
+                logger.info(
+                    "loopback_empty_translation",
+                    extra={"call_sid": call_sid, "event": "loopback"},
+                )
+                return
+            tts_wav = await synthesize_english_speech(english_text, sample_rate)
+            response_pcm = tts_wav_to_pcm16(tts_wav, sample_rate)
+            await _stream_pcm_to_exotel(websocket, stream_sid, response_pcm, sample_rate)
+            logger.info(
+                "loopback_playback_completed",
+                extra={"call_sid": call_sid, "event": "loopback"},
+            )
+        except asyncio.CancelledError:
+            raise
+        except (httpx.HTTPError, OSError, ValueError, RuntimeError):
+            logger.exception(
+                "loopback_processing_failed",
+                extra={"call_sid": call_sid, "event": "loopback"},
+            )
+        finally:
+            audio_frames.clear()
+            speech_active = False
+            last_speech_time = None
+            is_processing = False
+            utterance_task = None
 
     async def consume_audio() -> None:
         """Decode queued frames without delaying WebSocket reads."""
         nonlocal frames_processed, sequence_gaps, last_sequence, last_chunk_size
+        nonlocal speech_active, last_speech_time, is_processing, utterance_task
         while True:
             queued_packet = await audio_queue.get()
             try:
@@ -247,6 +343,29 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     "exotel_media_processed",
                     extra={"call_sid": call_sid, "event": "media", "chunk_count": frames_processed},
                 )
+                if sample_width == 2 and not is_processing:
+                    now = time.monotonic()
+                    energy = _pcm_rms(audio)
+                    if energy >= settings.vad_rms_threshold:
+                        speech_active = True
+                        last_speech_time = now
+                    if speech_active:
+                        audio_frames.extend(audio)
+                        if (
+                            last_speech_time is not None
+                            and now - last_speech_time >= settings.vad_silence_seconds
+                            and audio_frames
+                        ):
+                            is_processing = True
+                            captured_audio = bytes(audio_frames)
+                            utterance_task = asyncio.create_task(
+                                process_utterance(captured_audio),
+                                name="sarvam-exotel-loopback",
+                            )
+                            logger.info(
+                                "loopback_utterance_detected",
+                                extra={"call_sid": call_sid, "event": "loopback"},
+                            )
                 await process_audio_frame(
                     audio,
                     AudioFrameInfo(
@@ -365,6 +484,10 @@ async def exotel_stream(websocket: WebSocket) -> None:
         logger.info("exotel_stream_disconnected", extra={"call_sid": call_sid, "event": "disconnect"})
     finally:
         try:
+            if utterance_task and not utterance_task.done():
+                utterance_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await utterance_task
             await audio_queue.put(None)
             await audio_queue.join()
             await consumer_task

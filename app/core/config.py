@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     sarvam_api_key: str | None = Field(default=None, repr=False)
     sarvam_stt_model: str = "saaras:v3"
     sarvam_request_timeout_seconds: float = 60.0
+    sarvam_tts_model: str = "bulbul:v3"
+    sarvam_tts_speaker: str = "priya"
+    vad_rms_threshold: int = 400
+    vad_silence_seconds: float = 2.0
     recording_allowed_hosts: str = ""
     recordings_directory: Path = Path("./data/recordings")
     max_recording_bytes: int = 50 * 1024 * 1024

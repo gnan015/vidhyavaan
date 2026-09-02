@@ -1,0 +1,14 @@
+{
+  "call_sid": "29b2019c33ec3a0f6193003a6a5f1a92",
+  "audio_file": "call_29b2019c33ec3a0f6193003a6a5f1a92.wav",
+  "detected_language": "te-IN",
+  "original_transcript": "బీటెక్ అంటే ఏంటి? బీటెక్లో ఏం చేస్తారు?",
+  "english_script": "What is B.Tech? What do they teach in B.Tech?",
+  "created_at": "2026-09-02T17:02:34.133471+00:00",
+  "status": "completed",
+  "language_probability": 0.95,
+  "sarvam_request_ids": {
+    "transcribe": "20260902_ff42fa8b-48c3-4ee8-9018-ed8feedd6ee0",
+    "translate": "20260902_b9ce3df6-b5af-45f6-88f5-dab65e050f41"
+  }
+}
