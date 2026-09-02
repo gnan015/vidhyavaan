@@ -10,7 +10,7 @@ Usage:
 Requirements:
     pip install requests
 
-Replace SARVAM_API_KEY with your actual key before running.
+Set the SARVAM_API_KEY environment variable before running.
 """
 
 import base64
@@ -23,7 +23,7 @@ import requests
 # Configuration
 # ---------------------------------------------------------------------------
 
-SARVAM_API_KEY: str = "sk_4r5w9e4b_I7ApxAGis80e61wGOlocjL0H"  # <-- replace with your key
+SARVAM_API_KEY: str = os.getenv("SARVAM_API_KEY", "")
 
 STT_URL = "https://api.sarvam.ai/speech-to-text"
 TTS_URL = "https://api.sarvam.ai/text-to-speech"
@@ -237,7 +237,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Configuration check — warn early if the placeholder key is still set.
     # ------------------------------------------------------------------
-    if SARVAM_API_KEY == "YOUR_SARVAM_API_KEY":
+    if not SARVAM_API_KEY:
         print(
             "[ERROR] SARVAM_API_KEY is still set to the placeholder value.\n"
             "        Edit test_sarvam_audio.py and replace it with your real key."

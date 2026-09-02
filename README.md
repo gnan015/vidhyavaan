@@ -37,6 +37,10 @@ Set `EXOTEL_WEBHOOK_TOKEN` in `.env` to the same secret. Configure `RECORDING_AL
 
 `WS /ws/exotel-stream` accepts Exotel JSON handshake/media packets. It persists base64 `media.payload` frames to `recordings/call_{call_sid}.wav`, using `start.media_format` to determine the sample rate and bit depth; Exotel's absent metadata defaults to 8 kHz, 16-bit mono raw PCM. `audio/x-mulaw` frames are converted to 16-bit PCM before they are stored. Replace `process_audio_frame()` in `app/services/audio.py` with your STT provider adapter; keep it non-blocking or enqueue the frame.
 
+## Sarvam transcript and English translation
+
+Set `SARVAM_API_KEY` in `.env` to enable automatic post-call processing. Once a call WAV is written, the service schedules `transcribe_and_translate_audio()` and saves `recordings/call_{call_sid}_transcript.json` with the detected language, original transcript, English translation, timestamps, and any safe error state. The integration sends separate `transcribe` and `translate` requests to Sarvam's Saaras v3 `/speech-to-text` API so both outputs are retained. Sarvam REST STT is intended for recordings up to 30 seconds; use its batch/streaming APIs for longer calls.
+
 ## Security and operations
 
 Use a strong `EXOTEL_WEBHOOK_TOKEN`; clients provide it through `X-Exotel-Token` or query string. `EXOTEL_SIGNATURE_SECRET` enables the included HMAC-SHA256 placeholder over `METHOD + newline + path + newline + raw body`; confirm Exotel's documented signing scheme for the product/account and adjust `app/services/security.py` accordingly. Use a durable object store and job queue instead of local files/background tasks for multi-instance production deployments. JSON logs include call metadata but never audio content.

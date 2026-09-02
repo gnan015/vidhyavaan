@@ -18,12 +18,14 @@ from app.core.config import Settings, get_settings
 from app.schemas.exotel import AudioFrameInfo, ExotelCallback
 from app.services.audio import process_audio_frame
 from app.services.recordings import download_and_process_recording, validate_recording_url
+from app.services.sarvam import transcribe_and_translate_audio
 from app.services.security import verify_exotel_request
 
 router = APIRouter(tags=["exotel"])
 logger = logging.getLogger(__name__)
 XML_MEDIA_TYPE = "application/xml"
 STREAM_RECORDINGS_DIRECTORY = Path("recordings")
+_transcription_tasks: set[asyncio.Task[dict[str, Any]]] = set()
 
 
 def exotel_hangup_xml() -> str:
@@ -90,6 +92,19 @@ def _write_stream_wav(
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(audio)
     return output_path
+
+
+def _schedule_transcription(audio_path: Path, call_sid: str | None) -> None:
+    """Keep the post-call network task alive without delaying socket teardown."""
+    task = asyncio.create_task(
+        transcribe_and_translate_audio(str(audio_path)), name="sarvam-transcription"
+    )
+    _transcription_tasks.add(task)
+    task.add_done_callback(_transcription_tasks.discard)
+    logger.info(
+        "sarvam_transcription_scheduled",
+        extra={"call_sid": call_sid, "recording_path": str(audio_path), "event": "transcription"},
+    )
 
 
 def _smooth_and_normalize_pcm(audio: bytes, sample_rate: int, sample_width: int) -> bytes:
@@ -375,6 +390,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     "sequence_gaps": sequence_gaps,
                 },
             )
+            _schedule_transcription(output_path, call_sid)
         except Exception:
             logger.exception("exotel_stream_wav_write_failed", extra={"call_sid": call_sid, "event": "file_write"})
         if not consumer_task.done():

@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     exotel_webhook_token: str | None = Field(default=None, repr=False)
     exotel_signature_secret: str | None = Field(default=None, repr=False)
+    sarvam_api_key: str | None = Field(default=None, repr=False)
+    sarvam_stt_model: str = "saaras:v3"
+    sarvam_request_timeout_seconds: float = 60.0
     recording_allowed_hosts: str = ""
     recordings_directory: Path = Path("./data/recordings")
     max_recording_bytes: int = 50 * 1024 * 1024
@@ -32,4 +35,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-
