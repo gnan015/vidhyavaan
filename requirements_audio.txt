@@ -1,0 +1,10 @@
+﻿# requirements_audio.txt
+# Dependencies for process_recent_audio.py
+
+requests>=2.31.0       # HTTP client for Sarvam API calls
+tenacity>=8.2.0        # Exponential backoff / retry logic
+pydub>=0.25.1          # Audio format conversion (MP3/M4A/OGG -> WAV)
+                       # NOTE: pydub also requires ffmpeg on your PATH.
+                       #   Windows : https://ffmpeg.org/download.html
+                       #   macOS   : brew install ffmpeg
+                       #   Ubuntu  : sudo apt install ffmpeg
