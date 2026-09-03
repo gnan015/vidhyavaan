@@ -1,0 +1,26 @@
+[
+    {
+        "question": "What is an operating system?",
+        "expected": "rag"
+    },
+    {
+        "question": "What is deadlock?",
+        "expected": "rag"
+    },
+    {
+        "question": "What are the functions of an operating system?",
+        "expected": "rag"
+    },
+    {
+        "question": "What is process scheduling?",
+        "expected": "rag"
+    },
+    {
+        "question": "What is photosynthesis?",
+        "expected": "fallback"
+    },
+    {
+        "question": "Who is the current Prime Minister of India?",
+        "expected": "fallback"
+    }
+]

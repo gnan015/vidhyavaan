@@ -1,11 +1,13 @@
-"""Sarvam STT and English-translation post-processing for call recordings."""
+"""Sarvam speech, translation, and TTS services for call recordings."""
 
+import asyncio
 import json
 import logging
 import base64
 import io
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any
 import wave
 
@@ -16,6 +18,48 @@ from app.core.config import get_settings
 logger = logging.getLogger(__name__)
 SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
 SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
+SARVAM_TRANSLATE_URL = "https://api.sarvam.ai/translate"
+_sarvam_client: httpx.AsyncClient | None = None
+_sarvam_client_lock = asyncio.Lock()
+_sarvam_sync_client: httpx.Client | None = None
+_sarvam_sync_client_lock = Lock()
+
+
+async def get_sarvam_client() -> httpx.AsyncClient:
+    """Return a process-wide keep-alive client for low-latency Sarvam calls."""
+    global _sarvam_client
+    async with _sarvam_client_lock:
+        if _sarvam_client is None or _sarvam_client.is_closed:
+            settings = get_settings()
+            _sarvam_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(settings.sarvam_request_timeout_seconds),
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            )
+        return _sarvam_client
+
+
+async def close_sarvam_client() -> None:
+    global _sarvam_client, _sarvam_sync_client
+    if _sarvam_client is not None:
+        await _sarvam_client.aclose()
+        _sarvam_client = None
+    if _sarvam_sync_client is not None:
+        client = _sarvam_sync_client
+        _sarvam_sync_client = None
+        await asyncio.to_thread(client.close)
+
+
+def _get_sarvam_sync_client() -> httpx.Client:
+    """Thread-safe HTTP client for latency-sensitive live STT requests."""
+    global _sarvam_sync_client
+    with _sarvam_sync_client_lock:
+        if _sarvam_sync_client is None or _sarvam_sync_client.is_closed:
+            settings = get_settings()
+            _sarvam_sync_client = httpx.Client(
+                timeout=httpx.Timeout(settings.sarvam_request_timeout_seconds),
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            )
+        return _sarvam_sync_client
 
 
 def _output_path(audio_path: Path) -> Path:
@@ -58,34 +102,74 @@ async def _request_sarvam(
     return payload
 
 
-async def translate_wav_bytes(wav_audio: bytes) -> str:
-    """Translate one in-memory call utterance to English with Saaras v3."""
+def _translate_wav_to_english_sync(wav_audio: bytes) -> dict[str, Any]:
+    """Perform live STT in a worker thread so WebSocket keepalives can run."""
     if not wav_audio:
-        return ""
+        return {"english_query": "", "detected_language_code": "en-IN"}
     settings = get_settings()
     if not settings.sarvam_api_key:
         raise RuntimeError("SARVAM_API_KEY is not configured")
-    timeout = httpx.Timeout(settings.sarvam_request_timeout_seconds)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            SARVAM_STT_URL,
-            headers={"api-subscription-key": settings.sarvam_api_key},
-            files={"file": ("utterance.wav", wav_audio, "audio/wav")},
-            data={
-                "model": settings.sarvam_stt_model,
-                "mode": "translate",
-                "language_code": "unknown",
-            },
-        )
+    client = _get_sarvam_sync_client()
+    response = client.post(
+        SARVAM_STT_URL,
+        headers={"api-subscription-key": settings.sarvam_api_key},
+        files={"file": ("utterance.wav", wav_audio, "audio/wav")},
+        data={
+            "model": settings.sarvam_stt_model,
+            "mode": "translate",
+            "language_code": "unknown",
+        },
+    )
     response.raise_for_status()
     payload = response.json()
     transcript = payload.get("transcript") if isinstance(payload, dict) else None
     if not isinstance(transcript, str):
         raise ValueError("Sarvam translation response did not include a transcript")
-    return transcript.strip()
+    return {
+        "english_query": transcript.strip(),
+        "detected_language_code": payload.get("language_code", "en-IN"),
+    }
 
 
-async def synthesize_english_speech(text: str, sample_rate: int) -> bytes:
+async def translate_wav_to_english(wav_audio: bytes) -> dict[str, Any]:
+    """Translate an in-memory utterance without blocking the ASGI event loop."""
+    return await asyncio.to_thread(_translate_wav_to_english_sync, wav_audio)
+
+
+async def translate_wav_bytes(wav_audio: bytes) -> str:
+    """Backward-compatible English-only wrapper for recording consumers."""
+    return (await translate_wav_to_english(wav_audio))["english_query"]
+
+
+async def translate_english_text(text: str, target_language_code: str) -> str:
+    """Translate an English answer into the caller's native language."""
+    if not text.strip() or target_language_code == "en-IN":
+        return text
+    settings = get_settings()
+    if not settings.sarvam_api_key:
+        raise RuntimeError("SARVAM_API_KEY is not configured")
+    client = await get_sarvam_client()
+    response = await client.post(
+        SARVAM_TRANSLATE_URL,
+        headers={"api-subscription-key": settings.sarvam_api_key},
+        json={
+            "input": text[:2000],
+            "source_language_code": "en-IN",
+            "target_language_code": target_language_code,
+            "model": "sarvam-translate:v1",
+        },
+    )
+    response.raise_for_status()
+    payload = response.json()
+    translated = payload.get("translated_text") if isinstance(payload, dict) else None
+    if not isinstance(translated, str) or not translated.strip():
+        raise ValueError("Sarvam text translation response did not include text")
+    return translated.strip()
+
+
+async def synthesize_english_speech(
+    text: str, sample_rate: int, language_code: str = "en-IN"
+) -> bytes:
     """Generate a WAV response at the requested telephony sample rate."""
     if not text.strip():
         return b""
@@ -94,23 +178,28 @@ async def synthesize_english_speech(text: str, sample_rate: int) -> bytes:
     settings = get_settings()
     if not settings.sarvam_api_key:
         raise RuntimeError("SARVAM_API_KEY is not configured")
-    timeout = httpx.Timeout(settings.sarvam_request_timeout_seconds)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            SARVAM_TTS_URL,
-            headers={
-                "api-subscription-key": settings.sarvam_api_key,
-                "Content-Type": "application/json",
-            },
-            json={
-                "inputs": [text],
-                "target_language_code": "en-IN",
-                "speaker": settings.sarvam_tts_speaker,
-                "model": settings.sarvam_tts_model,
-                "speech_sample_rate": sample_rate,
-                "enable_preprocessing": True,
-                "pace": 1.0,
-            },
+    client = await get_sarvam_client()
+    response = await client.post(
+        SARVAM_TTS_URL,
+        headers={
+            "api-subscription-key": settings.sarvam_api_key,
+            "Content-Type": "application/json",
+        },
+        json={
+            "inputs": [text],
+            "target_language_code": language_code,
+            "speaker": settings.sarvam_tts_speaker,
+            "model": settings.sarvam_tts_model,
+            "speech_sample_rate": sample_rate,
+            "enable_preprocessing": True,
+            "pace": 1.0,
+        },
+    )
+    if response.is_error:
+        logger.error(
+            "sarvam_tts_request_rejected status=%s detail=%s",
+            response.status_code,
+            response.text[:1000],
         )
     response.raise_for_status()
     payload = response.json()
@@ -163,14 +252,13 @@ async def transcribe_and_translate_audio(audio_path: str) -> dict[str, Any]:
         if not settings.sarvam_api_key:
             raise RuntimeError("SARVAM_API_KEY is not configured")
 
-        timeout = httpx.Timeout(settings.sarvam_request_timeout_seconds)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            transcription = await _request_sarvam(
-                client, source, settings.sarvam_api_key, settings.sarvam_stt_model, "transcribe"
-            )
-            translation = await _request_sarvam(
-                client, source, settings.sarvam_api_key, settings.sarvam_stt_model, "translate"
-            )
+        client = await get_sarvam_client()
+        transcription = await _request_sarvam(
+            client, source, settings.sarvam_api_key, settings.sarvam_stt_model, "transcribe"
+        )
+        translation = await _request_sarvam(
+            client, source, settings.sarvam_api_key, settings.sarvam_stt_model, "translate"
+        )
 
         result.update(
             {

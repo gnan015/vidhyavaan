@@ -41,6 +41,18 @@ Set `EXOTEL_WEBHOOK_TOKEN` in `.env` to the same secret. Configure `RECORDING_AL
 
 Set `SARVAM_API_KEY` in `.env` to enable automatic post-call processing. Once a call WAV is written, the service schedules `transcribe_and_translate_audio()` and saves `recordings/call_{call_sid}_transcript.json` with the detected language, original transcript, English translation, timestamps, and any safe error state. The integration sends separate `transcribe` and `translate` requests to Sarvam's Saaras v3 `/speech-to-text` API so both outputs are retained. Sarvam REST STT is intended for recordings up to 30 seconds; use its batch/streaming APIs for longer calls.
 
+## Live RAG voice loop
+
+The attached SignalMinds core lives in `app/rag_core`. On a two-second caller pause, the WebSocket flow translates speech to English, calls its Groq RAG middleware off the event loop, translates the answer back to the detected caller language, and streams Sarvam TTS PCM frames back to the same Exotel WebSocket. Audio arriving during the bot turn is discarded so it cannot interrupt playback. The live adapter uses lightweight local PDF retrieval instead of the archive's ChromaDB/SentenceTransformer stack, which avoids unsupported PyTorch dependencies on Windows ARM64.
+
+Install the added RAG dependencies and set both `SARVAM_API_KEY` and `GROQ_API_KEY` in `.env`:
+
+```powershell
+pip install -r requirements.txt
+```
+
+The included textbook PDF is indexed in memory on first RAG request; no separate vector-database ingestion is needed. If the RAG stack or Groq call is unavailable, the caller hears a brief fallback response instead of the call dropping.
+
 ## Security and operations
 
 Use a strong `EXOTEL_WEBHOOK_TOKEN`; clients provide it through `X-Exotel-Token` or query string. `EXOTEL_SIGNATURE_SECRET` enables the included HMAC-SHA256 placeholder over `METHOD + newline + path + newline + raw body`; confirm Exotel's documented signing scheme for the product/account and adjust `app/services/security.py` accordingly. Use a durable object store and job queue instead of local files/background tasks for multi-instance production deployments. JSON logs include call metadata but never audio content.

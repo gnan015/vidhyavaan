@@ -27,6 +27,9 @@ class JsonFormatter(logging.Formatter):
             "frames_processed",
             "sequence_gaps",
             "status",
+            "frames_sent",
+            "stage",
+            "stop",
         ):
             value = getattr(record, field, None)
             if value is not None:

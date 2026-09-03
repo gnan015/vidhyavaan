@@ -1,3 +1,5 @@
 __pycache__/
 *.py[cod]
 .venv/
+app/rag_core/data/rag_text_cache.json
+.env
