@@ -51,7 +51,10 @@ class GroqLLM:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
-            temperature=0.2
+            temperature=0.2,
+            reasoning_effort="low",
+            include_reasoning=False,
+            max_tokens=100,
         )
 
         return response.choices[0].message.content

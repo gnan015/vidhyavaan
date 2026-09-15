@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 app/rag_core/data/rag_text_cache.json
 .env
+recordings/
+data/recordings/
+"__pycache__/" 
+"*.py[cod]" 

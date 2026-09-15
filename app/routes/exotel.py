@@ -21,13 +21,13 @@ from app.core.config import Settings, get_settings
 from app.schemas.exotel import AudioFrameInfo, ExotelCallback
 from app.services.audio import process_audio_frame
 from app.services.recordings import download_and_process_recording, validate_recording_url
-from app.services.sarvam import (
-    synthesize_english_speech,
+from app.services.bhashini import (
+    synthesize_speech,
     transcribe_and_translate_audio,
-    translate_wav_to_english,
-    tts_wav_to_pcm16,
+    transcribe_and_translate_wav,
+    tts_audio_to_pcm16,
 )
-from app.services.rag_middleware import query_rag
+from app.services.rag_middleware import get_language_profile, query_rag
 from app.services.security import verify_exotel_request
 
 router = APIRouter(tags=["exotel"])
@@ -55,26 +55,8 @@ def _stream_recording_path(call_sid: str | None) -> Path:
 
 
 def _fallback_response(language_code: str) -> str:
-    # Keep recovery speech conversational as well; it must not pass through a
-    # literal English-to-Telugu translation that would sound formal on a call.
-    if language_code.lower().startswith("te"):
-        return "Sorry, ippudu ee question ki answer dorakaledu. Please malli adagandi."
-    return _FALLBACK_RESPONSES.get(language_code, _FALLBACK_RESPONSES["en-IN"])
-
-
-def _shorten_for_voice(text: str, limit: int = 420) -> str:
-    """Keep spoken answers brief enough for reliable telephony TTS requests."""
-    normalized = " ".join(text.split())
-    if len(normalized) <= limit:
-        return normalized
-    boundary = max(
-        normalized.rfind(mark, 0, limit)
-        for mark in (". ", "? ", "! ", "। ")
-    )
-    if boundary > limit // 2:
-        return normalized[: boundary + 1]
-    word_boundary = normalized.rfind(" ", 0, limit)
-    return normalized[: word_boundary if word_boundary > 0 else limit].rstrip() + "..."
+    """Return conversational recovery speech for the detected caller language."""
+    return get_language_profile(language_code)["fallback"]
 
 
 def _sample_rate_from_media_format(media_format: object) -> int:
@@ -136,12 +118,12 @@ def _write_stream_wav(
 def _schedule_transcription(audio_path: Path, call_sid: str | None) -> None:
     """Keep the post-call network task alive without delaying socket teardown."""
     task = asyncio.create_task(
-        transcribe_and_translate_audio(str(audio_path)), name="sarvam-transcription"
+        transcribe_and_translate_audio(str(audio_path)), name="bhashini-transcription"
     )
     _transcription_tasks.add(task)
     task.add_done_callback(_transcription_tasks.discard)
     logger.info(
-        "sarvam_transcription_scheduled",
+        "bhashini_transcription_scheduled",
         extra={"call_sid": call_sid, "recording_path": str(audio_path), "event": "transcription"},
     )
 
@@ -192,7 +174,7 @@ def _pcm_rms(audio: bytes) -> float:
 
 
 def _pcm_to_wav_bytes(audio: bytes, sample_rate: int) -> bytes:
-    """Wrap Exotel PCM16 in a WAV container for Sarvam's multipart API."""
+    """Wrap Exotel PCM16 in a WAV container for Bhashini inference."""
     stream = io.BytesIO()
     with wave.open(stream, "wb") as wav_file:
         wav_file.setnchannels(1)
@@ -204,19 +186,25 @@ def _pcm_to_wav_bytes(audio: bytes, sample_rate: int) -> bytes:
 
 def _turn_telemetry(message: str, *, call_sid: str | None = None) -> None:
     """Print concise turn telemetry and retain it in structured application logs."""
-    print(message, flush=True)
+    try:
+        print(message, flush=True)
+    except UnicodeEncodeError:
+        safe_msg = message.encode("ascii", "replace").decode("ascii")
+        print(safe_msg, flush=True)
     logger.info(message, extra={"call_sid": call_sid, "event": "loopback"})
 
 
 def _stage_error(stage: str, error: Exception, *, call_sid: str | None) -> None:
     """Log a recoverable turn-stage failure without ending the WebSocket call."""
     message = f"[ERROR AT STAGE: {stage}] {type(error).__name__}: {error}"
-    print(message, flush=True)
+    try:
+        print(message, flush=True)
+    except UnicodeEncodeError:
+        print(message.encode("ascii", "replace").decode("ascii"), flush=True)
     logger.exception(
         "loopback_stage_failed",
         extra={"call_sid": call_sid, "event": "loopback", "stage": stage},
     )
-    # Keep a complete traceback in the Uvicorn console for live diagnosis.
     traceback.print_exc()
 
 
@@ -243,8 +231,8 @@ class _ExotelOutboundSender:
 
 
 def _exotel_frame_size(sample_rate: int) -> int:
-    """Return a 320-byte-aligned Exotel payload size, at least 3,200 bytes."""
-    return max(sample_rate * 2 // 10, 3_200) // 320 * 320
+    """Return one 100 ms frame of mono 16-bit PCM for Exotel playback."""
+    return sample_rate * 2 // 10
 
 
 async def _stream_pcm_to_exotel(
@@ -256,12 +244,10 @@ async def _stream_pcm_to_exotel(
 ) -> int:
     """Send Exotel-compliant PCM16 frames at approximately real-time pace.
 
-    Exotel requires each bidirectional payload to be at least 3,200 bytes and
-    a multiple of 320 bytes.  At the required 8 kHz PCM playback rate this is
-    a 200 ms frame (rather than the usual 100 ms/1,600 byte PCM frame).
+    Each payload is 100 ms of signed 16-bit little-endian mono PCM: 1,600 bytes
+    at 8 kHz and 3,200 bytes at 16 kHz.
     """
     frame_size = _exotel_frame_size(sample_rate)
-    frame_duration_seconds = frame_size / (sample_rate * 2)
     frames_sent = 0
     sender = sender or _ExotelOutboundSender(websocket, stream_sid)
     for offset in range(0, len(audio), frame_size):
@@ -271,8 +257,7 @@ async def _stream_pcm_to_exotel(
             chunk = chunk.ljust(frame_size, b"\x00")
         await sender.send_pcm(chunk, sample_rate)
         frames_sent += 1
-        # Leave a small scheduling margin while preserving real-time playback.
-        await asyncio.sleep(max(0.0, frame_duration_seconds - 0.01))
+        await asyncio.sleep(0.095)
     return frames_sent
 
 
@@ -287,7 +272,9 @@ async def _stream_processing_keepalive(
     """Keep the Voicebot stream active while STT/RAG/TTS waits on APIs."""
     frame_size = _exotel_frame_size(sample_rate)
     silence_frame = b"\x00" * frame_size
-    interval_seconds = frame_size / (sample_rate * 2)
+    # Keepalive packets are intentionally less frequent than playback packets:
+    # Exotel receives activity every 200 ms while API work is running.
+    interval_seconds = 0.2
     sent = 0
     _turn_telemetry("[KEEPALIVE] Streaming silent audio while the answer is prepared.", call_sid=call_sid)
     try:
@@ -311,6 +298,38 @@ async def _stream_processing_keepalive(
         _stage_error("KEEPALIVE", exc, call_sid=call_sid)
     finally:
         _turn_telemetry(f"[KEEPALIVE] Stopped after {sent} silent frame(s).", call_sid=call_sid)
+
+
+async def _stream_idle_keepalive(
+    sender: _ExotelOutboundSender,
+    sample_rate: int,
+    stop_event: asyncio.Event,
+    call_sid: str | None,
+) -> None:
+    """Keep a newly connected Voicebot call alive while waiting for caller speech."""
+    silence_frame = b"\x00" * _exotel_frame_size(sample_rate)
+    sent = 0
+    _turn_telemetry(
+        "[KEEPALIVE] Idle stream keepalive started; waiting for caller speech.",
+        call_sid=call_sid,
+    )
+    try:
+        while not stop_event.is_set():
+            await sender.send_pcm(silence_frame, sample_rate)
+            sent += 1
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=0.2)
+            except TimeoutError:
+                pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _stage_error("IDLE_KEEPALIVE", exc, call_sid=call_sid)
+    finally:
+        _turn_telemetry(
+            f"[KEEPALIVE] Idle stream keepalive stopped after {sent} frame(s).",
+            call_sid=call_sid,
+        )
 
 
 async def callback_payload(request: Request) -> dict[str, Any]:
@@ -355,6 +374,8 @@ async def exotel_stream(websocket: WebSocket) -> None:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     await websocket.accept()
+    client_host = websocket.client.host if websocket.client else "unknown"
+    print(f"[EXOTEL WS CONNECTED] Client IP: {client_host}", flush=True)
     call_sid: str | None = None
     stream_sid: str | None = None
     sample_rate = 8_000
@@ -373,10 +394,38 @@ async def exotel_stream(websocket: WebSocket) -> None:
     is_bot_turn = False
     utterance_task: asyncio.Task[None] | None = None
     outbound_sender: _ExotelOutboundSender | None = None
+    idle_keepalive_stop = asyncio.Event()
+    idle_keepalive_task: asyncio.Task[None] | None = None
+
+    async def stop_idle_keepalive() -> None:
+        """Stop call-wait keepalive before TTS playback uses the same sender."""
+        nonlocal idle_keepalive_task
+        idle_keepalive_stop.set()
+        if idle_keepalive_task and not idle_keepalive_task.done():
+            with suppress(asyncio.CancelledError):
+                await idle_keepalive_task
+        idle_keepalive_task = None
+
+    async def start_idle_keepalive() -> None:
+        """Start immediately after the Exotel stream ID is known, once only."""
+        nonlocal idle_keepalive_task
+        if not outbound_sender or not stream_sid:
+            return
+        if idle_keepalive_task and not idle_keepalive_task.done():
+            return
+        idle_keepalive_stop.clear()
+        # Send one frame synchronously so Exotel sees outbound media before any
+        # scheduler delay or Bhashini HTTP call.
+        await outbound_sender.send_pcm(b"\x00" * _exotel_frame_size(sample_rate), sample_rate)
+        idle_keepalive_task = asyncio.create_task(
+            _stream_idle_keepalive(outbound_sender, sample_rate, idle_keepalive_stop, call_sid),
+            name="exotel-idle-keepalive",
+        )
 
     async def process_utterance(captured_audio: bytes) -> None:
         """Run one recoverable STT -> RAG -> TTS turn without idling Exotel."""
         nonlocal speech_active, last_speech_time, is_bot_turn, utterance_task
+        turn_started = time.perf_counter()
         playback_sample_rate = settings.exotel_playback_sample_rate or sample_rate
         keepalive_stop = asyncio.Event()
         keepalive_task: asyncio.Task[None] | None = None
@@ -397,16 +446,16 @@ async def exotel_stream(websocket: WebSocket) -> None:
                 # technical vocabulary in the live phone response.
                 fallback_text = _fallback_response(language_code)
                 _turn_telemetry(
-                    "[TTS START] Synthesizing the recovery response via Sarvam AI...",
+                    "[TTS START] Synthesizing the recovery response via Bhashini...",
                     call_sid=call_sid,
                 )
                 fallback_started = time.perf_counter()
-                fallback_wav = await synthesize_english_speech(
+                fallback_wav = await synthesize_speech(
                     fallback_text,
                     playback_sample_rate,
                     language_code,
                 )
-                fallback_pcm = tts_wav_to_pcm16(
+                fallback_pcm = tts_audio_to_pcm16(
                     fallback_wav, playback_sample_rate
                 )
                 _turn_telemetry(
@@ -418,6 +467,11 @@ async def exotel_stream(websocket: WebSocket) -> None:
                 frames = (len(fallback_pcm) + _exotel_frame_size(playback_sample_rate) - 1) // _exotel_frame_size(playback_sample_rate)
                 _turn_telemetry(
                     f"[PLAYBACK] Streaming {frames} recovery frame(s) back to Exotel...",
+                    call_sid=call_sid,
+                )
+                _turn_telemetry(
+                    "[TOTAL TURNAROUND] "
+                    f"{time.perf_counter() - turn_started:.2f}s to recovery playback frame.",
                     call_sid=call_sid,
                 )
                 await _stream_pcm_to_exotel(
@@ -439,6 +493,9 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     extra={"call_sid": call_sid, "event": "loopback"},
                 )
                 return
+            # The call-level keepalive runs while waiting for caller speech.
+            # Stop it before the processing keepalive/TTS sequence takes over.
+            await stop_idle_keepalive()
             # Send this frame before starting any external HTTP work.  Creating
             # a background task alone is insufficient if DNS/TLS setup delays
             # the event loop before that task gets a chance to run.
@@ -473,15 +530,16 @@ async def exotel_stream(websocket: WebSocket) -> None:
             try:
                 wav_audio = _pcm_to_wav_bytes(captured_audio, sample_rate)
                 _turn_telemetry(
-                    f"[STT START] Sending {len(wav_audio):,} bytes to Sarvam AI STT...",
+                    f"[STT START] Sending {len(wav_audio):,} bytes to Bhashini ALD and ASR...",
                     call_sid=call_sid,
                 )
                 stt_started = time.perf_counter()
-                recognition = await translate_wav_to_english(wav_audio)
+                recognition = await transcribe_and_translate_wav(wav_audio, call_sid=call_sid)
                 english_query = str(recognition.get("english_query") or "").strip()
                 detected_language_code = str(
-                    recognition.get("detected_language_code") or "en-IN"
+                    recognition.get("detected_language_code") or settings.default_caller_language or "te-IN"
                 )
+                print(f"[LANGUAGE DETECTED]: {detected_language_code} | Query: {english_query}", flush=True)
                 _turn_telemetry(
                     "[STT FINISH] Transcribed in "
                     f"{time.perf_counter() - stt_started:.2f}s | Detected: "
@@ -489,7 +547,11 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     call_sid=call_sid,
                 )
                 if not english_query:
-                    raise ValueError("Sarvam returned an empty transcription")
+                    _turn_telemetry(
+                        "[STT] Empty/noise-only utterance. Listening again.",
+                        call_sid=call_sid,
+                    )
+                    return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -512,6 +574,15 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     )
                     if not english_answer:
                         raise RuntimeError("RAG middleware returned no usable answer")
+                    english_answer = (
+                        english_answer.replace("\u2011", "-")
+                        .replace("\u2013", "-")
+                        .replace("\u2014", "-")
+                        .replace("\u2018", "'")
+                        .replace("\u2019", "'")
+                        .replace("\u201c", '"')
+                        .replace("\u201d", '"')
+                    )
                     _turn_telemetry(
                         "[RAG FINISH] RAG responded in "
                         f"{time.perf_counter() - rag_started:.2f}s | Answer: "
@@ -533,10 +604,11 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     call_sid=call_sid,
                 )
 
-            # RAG/Groq already generated the answer directly in the target voice
-            # style (for example, Tinglish). Keep it brief for TTS, but never
-            # run a full-text English-to-native-language translation afterwards.
-            spoken_answer = _shorten_for_voice(english_answer, limit=360)
+            # RAG/Groq owns both brevity and sentence completion. Do not slice
+            # generated text in Python: that can cut a spoken answer mid-sentence.
+            spoken_answer = english_answer.strip()
+            if len(spoken_answer) > 500:
+                raise ValueError("Voice response exceeded Bhashini's telephony text limit")
 
             try:
                 _turn_telemetry(
@@ -544,15 +616,15 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     call_sid=call_sid,
                 )
                 _turn_telemetry(
-                    "[TTS START] Synthesizing speech via Sarvam AI...", call_sid=call_sid
+                    "[TTS START] Synthesizing speech via Bhashini...", call_sid=call_sid
                 )
                 tts_started = time.perf_counter()
-                tts_wav = await synthesize_english_speech(
+                tts_wav = await synthesize_speech(
                     spoken_answer, playback_sample_rate, detected_language_code
                 )
-                response_pcm = tts_wav_to_pcm16(tts_wav, playback_sample_rate)
+                response_pcm = tts_audio_to_pcm16(tts_wav, playback_sample_rate)
                 if not response_pcm:
-                    raise ValueError("Sarvam TTS returned no playable PCM audio")
+                    raise ValueError("Bhashini TTS returned no playable PCM audio")
                 _turn_telemetry(
                     "[TTS FINISH] Generated "
                     f"{playback_sample_rate // 1000}kHz PCM audio in "
@@ -575,6 +647,11 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     call_sid=call_sid,
                 )
                 playback_started = time.perf_counter()
+                _turn_telemetry(
+                    "[TOTAL TURNAROUND] "
+                    f"{playback_started - turn_started:.2f}s to first playback frame.",
+                    call_sid=call_sid,
+                )
                 frames_sent = await _stream_pcm_to_exotel(
                     websocket,
                     stream_sid,
@@ -599,11 +676,20 @@ async def exotel_stream(websocket: WebSocket) -> None:
             _stage_error("TURN", exc, call_sid=call_sid)
         finally:
             await stop_keepalive()
+            _turn_telemetry(
+                "[TURN COMPLETE] "
+                f"{time.perf_counter() - turn_started:.2f}s",
+                call_sid=call_sid,
+            )
             audio_frames.clear()
             speech_active = False
             last_speech_time = None
             is_bot_turn = False
             utterance_task = None
+            try:
+                await start_idle_keepalive()
+            except Exception as exc:
+                _stage_error("IDLE_KEEPALIVE", exc, call_sid=call_sid)
 
     async def consume_audio() -> None:
         """Decode queued frames without delaying WebSocket reads."""
@@ -681,7 +767,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
                                 )
                                 utterance_task = asyncio.create_task(
                                     process_utterance(captured_audio),
-                                    name="sarvam-exotel-loopback",
+                                    name="bhashini-exotel-loopback",
                                 )
                                 logger.info(
                                     "loopback_utterance_detected",
@@ -747,6 +833,8 @@ async def exotel_stream(websocket: WebSocket) -> None:
                 logger.warning("invalid_stream_packet", extra={"call_sid": call_sid, "event": "stream_error"})
                 continue
             event = packet.get("event")
+            if event != "media":
+                print(f"[EXOTEL RAW PACKET] {text}", flush=True)
             if event == "connected":
                 logger.info("exotel_stream_connected", extra={"call_sid": call_sid, "event": "connected"})
             elif event == "start":
@@ -756,9 +844,18 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     metadata.get("call_sid")
                     or metadata.get("callSid")
                     or metadata.get("CallSid")
+                    or packet.get("call_sid")
+                    or packet.get("callSid")
                     or call_sid
+                    or "unknown"
                 )
-                stream_sid = metadata.get("stream_sid") or metadata.get("streamSid") or stream_sid
+                stream_sid = (
+                    metadata.get("stream_sid")
+                    or metadata.get("streamSid")
+                    or packet.get("stream_sid")
+                    or packet.get("streamSid")
+                    or stream_sid
+                )
                 # Exotel normally supplies snake_case fields inside `start`.
                 raw_start = packet.get("start", {})
                 media_format = (
@@ -785,6 +882,11 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     sample_width = 2
                 if stream_sid:
                     outbound_sender = _ExotelOutboundSender(websocket, stream_sid)
+                else:
+                    logger.error(
+                        "exotel_start_missing_stream_sid",
+                        extra={"call_sid": call_sid, "event": "start", "start": metadata},
+                    )
                 logger.info(
                     "exotel_stream_started",
                     extra={
@@ -794,6 +896,13 @@ async def exotel_stream(websocket: WebSocket) -> None:
                         "media_format": media_format,
                     },
                 )
+                if outbound_sender and stream_sid:
+                    try:
+                        await start_idle_keepalive()
+                    except Exception as exc:
+                        # The receive loop remains active even if an outbound
+                        # keepalive frame fails during startup.
+                        _stage_error("STARTUP", exc, call_sid=call_sid)
             elif event == "media":
                 media = packet.get("media")
                 if not isinstance(media, dict) or not isinstance(media.get("payload"), str):
@@ -846,6 +955,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
         _stage_error("WEBSOCKET", exc, call_sid=call_sid)
     finally:
         try:
+            await stop_idle_keepalive()
             if utterance_task and not utterance_task.done():
                 utterance_task.cancel()
                 with suppress(asyncio.CancelledError):

@@ -24,37 +24,117 @@ _build_rag_prompt = None
 _documents: list[dict[str, Any]] | None = None
 _documents_origin = "memory"
 _sessions: dict[str, list[dict[str, str]]] = {}
+_groq_client: AsyncGroq | None = None
+_groq_client_lock = asyncio.Lock()
+
+LANGUAGE_PROFILES: dict[str, dict[str, str]] = {
+    "hi-IN": {"name": "Hindi", "style": "Hinglish (conversational Hindi written in Latin/English script)", "example": "CPU scheduling ek mechanism hai jisme operating system processes ko CPU time allocate karta hai, jaise Round Robin aur FCFS algorithms.", "fallback": "Sorry, abhi answer fetch nahi ho paya. Please phir se poochiye."},
+    "te-IN": {"name": "Telugu", "style": "Tinglish (conversational Telugu written in Latin/English script)", "example": "CPU scheduling ante operating system lo processes ki CPU time allocate chese mechanism, like FCFS mariyu Round Robin algorithms.", "fallback": "Sorry, ippudu answer fetch avvaledu. Please malli adagandi."},
+    "ta-IN": {"name": "Tamil", "style": "Tanglish (conversational Tamil written in Latin/English script)", "example": "Deadlock na operating system-la rendu processes resource kaaga wait panni block aaguradhu, idhai Banker's algorithm use panni handle panlaam.", "fallback": "Sorry, ippo answer fetch panna mudiyala. Please marubadiyum kelunga."},
+    "kn-IN": {"name": "Kannada", "style": "Kanglish (conversational Kannada written in Latin/English script)", "example": "CPU scheduling andre operating system-alli processes ge CPU time allocate maduva mechanism, like Round Robin mathu FCFS algorithms.", "fallback": "Sorry, ivaga answer fetch agalilla. Please matte keli."},
+    "ml-IN": {"name": "Malayalam", "style": "Manglish (conversational Malayalam written in Latin/English script)", "example": "CPU scheduling ennal operating system-il processes-inu CPU time allocate cheyyunna mechanism aanu, like Round Robin algorithms.", "fallback": "Sorry, ippo answer fetch cheyyan pattiyilla. Please veendum chodikku."},
+    "mr-IN": {"name": "Marathi", "style": "Conversational Marathi in Latin/English script mixed with English", "example": "CPU scheduling mhanje operating system madhye processes na CPU time allocate karnari mechanism, jase Round Robin algorithms.", "fallback": "Sorry, ata answer fetch zala nahi. Please punha vichara."},
+    "bn-IN": {"name": "Bengali", "style": "Benglish (conversational Bengali written in Latin/English script)", "example": "Virtual memory operating system er emon ekta technique jekhane RAM kom thakleo secondary storage ke main memory hishebe use kora hoy.", "fallback": "Sorry, ekhon answer fetch kora jayni. Please abar jiggesh korun."},
+    "gu-IN": {"name": "Gujarati", "style": "Conversational Gujarati in Latin/English script mixed with English", "example": "CPU scheduling etle operating system ma processes ne CPU time allocate karvano mechanism, jem ke Round Robin algorithms.", "fallback": "Sorry, atyare answer fetch thai shakyo nathi. Please fari pucho."},
+    "pa-IN": {"name": "Punjabi", "style": "Conversational Punjabi in Latin/English script mixed with English", "example": "CPU scheduling ik mechanism hai jis naal operating system processes nu CPU time allocate karda hai, jiwe Round Robin algorithms.", "fallback": "Sorry, hun answer fetch nahi ho sakya. Please phir pucho."},
+    "od-IN": {"name": "Odia", "style": "Conversational Odia in Latin/English script mixed with English", "example": "CPU scheduling heuchi operating system re processes ku CPU time allocate kariba mechanism, jemiti Round Robin algorithms.", "fallback": "Sorry, ebe answer fetch heiparila nahi. Please puni pacharantu."},
+    "en-IN": {"name": "English", "style": "Clear, concise Indian English", "example": "CPU scheduling is the operating system mechanism that allocates CPU time to ready processes using algorithms like FCFS and Round Robin.", "fallback": "Sorry, I could not fetch the answer. Please ask again."},
+}
+DEFAULT_PROFILE: dict[str, str] = {
+    "name": "Telugu",
+    "style": "Tinglish (conversational Telugu written in Latin/English script)",
+    "example": "CPU scheduling ante operating system lo processes ki CPU time allocate chese mechanism, like FCFS mariyu Round Robin algorithms.",
+    "fallback": "Sorry, ippudu answer fetch avvaledu. Please malli adagandi.",
+}
+_LANGUAGE_PROFILES_BY_NORMALIZED_CODE = {code.lower(): profile for code, profile in LANGUAGE_PROFILES.items()}
+
+VERNACULAR_KEYWORD_PATTERNS = {
+    "te-IN": re.compile(r"\b(ante|enti|ela|mariyu|lo|unna|chese|cheppandi|cheyadam|kadha|gurinchi|enduku|chesukondi)\b", re.IGNORECASE),
+    "ta-IN": re.compile(r"\b(enna|epdi|adha|pannuvanga|solunga|la|kaaga|irukku|enna-na|panlaam)\b", re.IGNORECASE),
+    "bn-IN": re.compile(r"\b(ki|bhabe|kaaj|kore|bolun|ekta|jekhane|kora|hoy)\b", re.IGNORECASE),
+    "hi-IN": re.compile(r"\b(kya|kaise|hota|hoti|hai|bataiye|batao|karte|jisme|karega)\b", re.IGNORECASE),
+}
+
 
 VOICE_AGENT_SYSTEM_PROMPT = """
-You are an intelligent, friendly AI voice assistant answering phone calls.
-Follow these strict conversational voice guidelines:
-1. Brevity: Answer in 1 to 2 short, direct sentences (maximum 35-40 words). The response will be spoken aloud over a phone call.
-2. Language style:
-   - If the user speaks Telugu, respond in natural spoken Tinglish (conversational Telugu blended with English).
-   - NEVER translate technical concepts, computer science terms, or modern everyday nouns into pure or formal Telugu (e.g., keep "Operating System", "CPU", "Internet", "Memory" as English words).
-   - The pronunciation and flow should sound like a modern urban conversation.
-   - If the user speaks English, respond in clear, concise English.
-3. No formatting: Do not include asterisks, bullet points, Markdown, emojis, or code blocks, as text will be read directly by Text-to-Speech.
+You are an ultra-fast, conversational AI voice tutor answering live phone calls for rural students ("Shiksha Vani").
+
+STRICT CRITICAL RULES:
+1. Script & Transliteration Requirement:
+   - OUTPUT ONLY IN PLAIN ASCII LATIN/ENGLISH SCRIPT (Roman transliteration).
+   - NEVER output native Indic scripts (NO Telugu script తెలుగు, NO Devanagari हिन्दी, NO Tamil script தமிழ், NO Bengali script বাংলা).
+   - The phone TTS system expects pure Roman alphabet Latin text (e.g., "ante", "cheppandi", "karega", "panlaam").
+
+2. Natural Code-Mixed Vernacular + English Technical Terms:
+   - When speaking regional languages (Telugu, Tamil, Hindi, Bengali, etc.), speak in NATURAL CONVERSATIONAL CODE-MIXED style (e.g., Tinglish, Tanglish, Hinglish, Benglish).
+   - ALL academic, technical, IT, scientific, and computing terms MUST REMAIN IN ENGLISH. Retain words like: CPU, Scheduling, Process, Thread, Operating System, Memory, RAM, Virtual Memory, Deadlock, Algorithm, Round Robin, FCFS, Photosynthesis, Database, Cache, Hardware.
+   - NEVER translate technical concepts into complex or archaic native words.
+   - Examples of desired conversational code-mixed vernacular:
+     * Telugu (Tinglish): "CPU scheduling ante operating system lo processes ki CPU time allocate chese mechanism, like FCFS mariyu Round Robin algorithms."
+     * Tamil (Tanglish): "Deadlock na operating system-la rendu processes resource kaaga wait panni block aaguradhu, idhai Banker's algorithm use panni handle panlaam."
+     * Hindi (Hinglish): "CPU scheduling ek mechanism hai jisme operating system processes ko CPU time allocate karta hai, jaise Round Robin aur FCFS algorithms."
+     * Bengali (Benglish): "Virtual memory operating system er emon ekta technique jekhane RAM kom thakleo secondary storage ke main memory hishebe use kora hoy."
+
+3. Spoken Brevity and Phone Call Format:
+   - Keep answers strictly to 1 to 2 concise spoken sentences (25 to 35 words maximum).
+   - Make it sound warm, encouraging, and natural for a telephone conversation.
+   - Never stop mid-thought; always finish the final sentence cleanly with punctuation (. or !).
+   - ABSOLUTELY NO bullet points, lists, numbered items, Markdown formatting, asterisks, or emojis.
 """.strip()
+
+
+def get_language_profile(language_code: str | None) -> dict[str, str]:
+    """Return a case-insensitive caller-language profile, with a safe default."""
+    normalized = str(language_code or "").strip().lower()
+    return _LANGUAGE_PROFILES_BY_NORMALIZED_CODE.get(normalized, DEFAULT_PROFILE)
 
 
 def _language_style_instruction(language_code: str) -> str:
     """Tell the LLM exactly how the phone caller should hear the answer."""
-    normalized = language_code.lower()
-    if normalized.startswith("te"):
-        return (
-            "The caller spoke Telugu. Respond in natural spoken Tinglish, using "
-            "Roman/English letters as in everyday conversation. Keep all technical "
-            "terms, IT words, programming concepts, acronyms, and modern nouns in "
-            "English. Do not use formal or textbook Telugu translations."
-        )
-    if normalized.startswith("en"):
-        return "The caller spoke English. Respond in concise, clear English."
+    profile = get_language_profile(language_code)
+    example = profile.get("example", "")
+    if profile["name"] == "English":
+        settings = get_settings()
+        default_lang = getattr(settings, "default_caller_language", "te-IN")
+        if default_lang and default_lang != "en-IN":
+            def_profile = get_language_profile(default_lang)
+            return (
+                f"The caller is a regional student who may ask questions using English technical words. "
+                f"Respond in natural conversational {def_profile['style']} where all technical terms remain in English. "
+                f"MANDATORY: Output ONLY in Roman/Latin script (ASCII English letters), NEVER in native script! "
+                f"Example response style: \"{def_profile.get('example', '')}\". Keep to 1-2 spoken sentences."
+            )
+        return "The caller spoke English. Respond in concise, clear English in 1-2 spoken sentences."
     return (
-        f"The caller language is {language_code}. Respond conversationally in that "
-        "language while keeping technical terms, IT words, programming concepts, "
-        "acronyms, and modern nouns in English."
+        f"DETECTED CALLER LANGUAGE OVERRIDES the translated English query: {profile['name']} ({language_code}). "
+        f"You MUST respond in {profile['style']}. "
+        f"MANDATORY: Output ONLY in Roman/Latin script (ASCII English letters), NEVER in native script! "
+        f"Keep ALL academic, computing, and technical terms in English (e.g., CPU, Process, Scheduling, Deadlock, Algorithm, Memory). "
+        f"Use natural conversational words for everything else (e.g. for Telugu use 'ante', 'lo', 'chese', 'mariyu'). "
+        f"Example response style: \"{example}\". "
+        f"Keep response to 1-2 concise spoken sentences (under 35 words)."
     )
+
+
+async def _get_groq_client() -> AsyncGroq:
+    """Return one process-wide client so fallback calls reuse TCP/TLS sessions."""
+    global _groq_client
+    settings = get_settings()
+    if not settings.groq_api_key:
+        raise RuntimeError("GROQ_API_KEY is not configured")
+    async with _groq_client_lock:
+        if _groq_client is None:
+            _groq_client = AsyncGroq(api_key=settings.groq_api_key)
+        return _groq_client
+
+
+async def close_groq_client() -> None:
+    """Close the shared Groq HTTP session during FastAPI shutdown."""
+    global _groq_client
+    async with _groq_client_lock:
+        client, _groq_client = _groq_client, None
+    if client is not None:
+        await client.close()
 
 
 def _chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> list[str]:
@@ -177,12 +257,30 @@ def _load_llm() -> tuple[Any, Any]:
 
 
 def _is_textbook_insufficient(answer: str) -> bool:
+    """Return true when the PDF-answer model declined to answer the question.
+
+    Retrieval can return loosely related OS chunks for a question such as
+    ``deadlock``. In that case the RAG LLM may decline in many different words;
+    treat every such decline as an explicit signal to use Groq general knowledge.
+    """
     normalized = answer.lower()
     indicators = (
         "provided textbook excerpts do not contain",
         "textbook context is insufficient",
         "cannot give an answer based on that context",
         "can't give an answer based on that context",
+        "not available in the provided",
+        "not available in this context",
+        "not covered in the provided",
+        "not covered in this context",
+        "do not have enough information",
+        "don't have enough information",
+        "do not have information about",
+        "don't have information about",
+        "i don't know based on",
+        "unable to find information",
+        "could not find information",
+        "out of context",
     )
     return any(indicator in normalized for indicator in indicators)
 
@@ -196,6 +294,9 @@ TEXTBOOK CONTEXT:
 {context}
 
 STUDENT QUESTION: {question}
+
+REQUIRED RESPONSE LANGUAGE AND SCRIPT:
+{_language_style_instruction(language_code)}
 """
 
 
@@ -256,6 +357,52 @@ def _query_textbook_sync(
                 extra={"event": "rag", "best_score": best_score, "match_count": len(matches)},
             )
             return None
+def _clean_spoken_text(text: str) -> str:
+    """Normalize unicode quotes, dashes, and whitespace for TTS engines and console printing."""
+    return (
+        text.replace("\u2011", "-")
+        .replace("\u2012", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2026", "...")
+        .strip()
+    )
+
+
+def _resolve_target_language(query: str, language_code: str) -> str:
+    """Detect vernacular markers if ALD or caller language defaulted to en-IN."""
+    norm = str(language_code or "").strip().lower()
+    # Check if query itself has explicit vernacular words
+    for code, pattern in VERNACULAR_KEYWORD_PATTERNS.items():
+        if pattern.search(query):
+            return code
+    if norm in {"", "en-in", "en"}:
+        settings = get_settings()
+        default_lang = getattr(settings, "default_caller_language", "te-IN")
+        if default_lang and default_lang.lower() not in {"en-in", "en"}:
+            return default_lang
+    return language_code or "te-IN"
+
+
+def _query_textbook_sync(
+    english_query: str, session_id: str, language_code: str
+) -> str | None:
+    """Return a PDF-grounded voice answer, or ``None`` when fallback is needed."""
+    target_lang = _resolve_target_language(english_query, language_code)
+    with _core_lock:
+        llm, _ = _load_llm()
+        history = _sessions.setdefault(session_id, []).copy()
+        matches, best_score = _retrieve(english_query)
+        if not matches or best_score < get_settings().rag_min_retrieval_score:
+            logger.info(
+                "rag_retrieval_insufficient",
+                extra={"event": "rag", "best_score": best_score, "match_count": len(matches)},
+            )
+            return None
         context = "\n".join(
             f"Book: {match['book']}\nPage: {match['page']}\nContent:\n{match['text']}"
             for match in matches
@@ -263,14 +410,14 @@ def _query_textbook_sync(
         # Do not use the generic core prompt: this response must already be in
         # the caller's spoken style so no mechanical translation is necessary.
         answer = llm.generate(
-            _voice_rag_prompt(english_query, context, language_code),
+            _voice_rag_prompt(english_query, context, target_lang),
             history,
-            system_prompt=_voice_system_message(language_code),
+            system_prompt=_voice_system_message(target_lang),
         )
         if not isinstance(answer, str) or not answer.strip() or _is_textbook_insufficient(answer):
             logger.info("rag_answer_insufficient", extra={"event": "rag"})
             return None
-    answer = answer.strip()
+    answer = _clean_spoken_text(answer)
     _save_turn(session_id, english_query, answer)
     return answer
 
@@ -279,6 +426,7 @@ async def _query_groq_fallback(
     english_query: str, session_id: str, language_code: str
 ) -> str | None:
     """Call Groq directly only after retrieval has no usable PDF context."""
+    target_lang = _resolve_target_language(english_query, language_code)
     settings = get_settings()
     if not settings.groq_api_key:
         logger.error("groq_fallback_unconfigured", extra={"event": "groq_fallback"})
@@ -288,20 +436,24 @@ async def _query_groq_fallback(
     started = loop.time()
     logger.info("[GROQ FALLBACK START] Querying general knowledge.", extra={"event": "groq_fallback"})
     try:
-        client = AsyncGroq(api_key=settings.groq_api_key)
+        client = await _get_groq_client()
         response = await asyncio.wait_for(
             client.chat.completions.create(
                 model=settings.groq_model,
-                messages=_general_groq_messages(english_query, language_code, history),
+                messages=_general_groq_messages(english_query, target_lang, history),
                 temperature=0.2,
-                max_tokens=140,
+                # GPT-OSS otherwise spends the small voice budget on hidden
+                # reasoning and can return an empty final message.
+                reasoning_effort="low",
+                include_reasoning=False,
+                max_tokens=100,
             ),
             timeout=settings.rag_query_timeout_seconds,
         )
         answer = response.choices[0].message.content
         if not isinstance(answer, str) or not answer.strip():
             raise RuntimeError("Groq fallback returned no answer")
-        answer = answer.strip()
+        answer = _clean_spoken_text(answer)
         await asyncio.to_thread(_save_turn, session_id, english_query, answer)
         duration = loop.time() - started
         logger.info(
@@ -319,9 +471,10 @@ async def query_rag(
     english_query: str, session_id: str, language_code: str = "en-IN"
 ) -> str | None:
     """Return a caller-style PDF answer, falling back to direct Groq if needed."""
+    resolved_lang = _resolve_target_language(english_query, language_code)
     try:
         textbook_answer = await asyncio.wait_for(
-            asyncio.to_thread(_query_textbook_sync, english_query, session_id, language_code),
+            asyncio.to_thread(_query_textbook_sync, english_query, session_id, resolved_lang),
             timeout=get_settings().rag_query_timeout_seconds,
         )
         if textbook_answer:
@@ -330,7 +483,7 @@ async def query_rag(
         logger.warning("rag_query_timed_out", extra={"event": "rag"})
     except Exception:
         logger.exception("rag_query_failed", extra={"event": "rag"})
-    return await _query_groq_fallback(english_query, session_id, language_code)
+    return await _query_groq_fallback(english_query, session_id, resolved_lang)
 
 
 async def warm_rag_index() -> None:
