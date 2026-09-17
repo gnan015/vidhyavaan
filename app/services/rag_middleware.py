@@ -27,43 +27,168 @@ _sessions: dict[str, list[dict[str, str]]] = {}
 _groq_client: AsyncGroq | None = None
 _groq_client_lock = asyncio.Lock()
 
+def _is_native_script_mode() -> bool:
+    settings = get_settings()
+    return getattr(settings, "bhashini_tts_script_mode", "native").strip().lower() == "native"
+
+
 LANGUAGE_PROFILES: dict[str, dict[str, str]] = {
-    "hi-IN": {"name": "Hindi", "style": "Hinglish (conversational Hindi written in Latin/English script)", "example": "CPU scheduling ek mechanism hai jisme operating system processes ko CPU time allocate karta hai, jaise Round Robin aur FCFS algorithms.", "fallback": "Sorry, abhi answer fetch nahi ho paya. Please phir se poochiye."},
-    "te-IN": {"name": "Telugu", "style": "Tinglish (conversational Telugu written in Latin/English script)", "example": "CPU scheduling ante operating system lo processes ki CPU time allocate chese mechanism, like FCFS mariyu Round Robin algorithms.", "fallback": "Sorry, ippudu answer fetch avvaledu. Please malli adagandi."},
-    "ta-IN": {"name": "Tamil", "style": "Tanglish (conversational Tamil written in Latin/English script)", "example": "Deadlock na operating system-la rendu processes resource kaaga wait panni block aaguradhu, idhai Banker's algorithm use panni handle panlaam.", "fallback": "Sorry, ippo answer fetch panna mudiyala. Please marubadiyum kelunga."},
-    "kn-IN": {"name": "Kannada", "style": "Kanglish (conversational Kannada written in Latin/English script)", "example": "CPU scheduling andre operating system-alli processes ge CPU time allocate maduva mechanism, like Round Robin mathu FCFS algorithms.", "fallback": "Sorry, ivaga answer fetch agalilla. Please matte keli."},
-    "ml-IN": {"name": "Malayalam", "style": "Manglish (conversational Malayalam written in Latin/English script)", "example": "CPU scheduling ennal operating system-il processes-inu CPU time allocate cheyyunna mechanism aanu, like Round Robin algorithms.", "fallback": "Sorry, ippo answer fetch cheyyan pattiyilla. Please veendum chodikku."},
-    "mr-IN": {"name": "Marathi", "style": "Conversational Marathi in Latin/English script mixed with English", "example": "CPU scheduling mhanje operating system madhye processes na CPU time allocate karnari mechanism, jase Round Robin algorithms.", "fallback": "Sorry, ata answer fetch zala nahi. Please punha vichara."},
-    "bn-IN": {"name": "Bengali", "style": "Benglish (conversational Bengali written in Latin/English script)", "example": "Virtual memory operating system er emon ekta technique jekhane RAM kom thakleo secondary storage ke main memory hishebe use kora hoy.", "fallback": "Sorry, ekhon answer fetch kora jayni. Please abar jiggesh korun."},
-    "gu-IN": {"name": "Gujarati", "style": "Conversational Gujarati in Latin/English script mixed with English", "example": "CPU scheduling etle operating system ma processes ne CPU time allocate karvano mechanism, jem ke Round Robin algorithms.", "fallback": "Sorry, atyare answer fetch thai shakyo nathi. Please fari pucho."},
-    "pa-IN": {"name": "Punjabi", "style": "Conversational Punjabi in Latin/English script mixed with English", "example": "CPU scheduling ik mechanism hai jis naal operating system processes nu CPU time allocate karda hai, jiwe Round Robin algorithms.", "fallback": "Sorry, hun answer fetch nahi ho sakya. Please phir pucho."},
-    "od-IN": {"name": "Odia", "style": "Conversational Odia in Latin/English script mixed with English", "example": "CPU scheduling heuchi operating system re processes ku CPU time allocate kariba mechanism, jemiti Round Robin algorithms.", "fallback": "Sorry, ebe answer fetch heiparila nahi. Please puni pacharantu."},
-    "en-IN": {"name": "English", "style": "Clear, concise Indian English", "example": "CPU scheduling is the operating system mechanism that allocates CPU time to ready processes using algorithms like FCFS and Round Robin.", "fallback": "Sorry, I could not fetch the answer. Please ask again."},
+    "te-IN": {
+        "name": "Telugu",
+        "script_name": "Telugu script (తెలుగు)",
+        "teacher_dialect": "neutral, polite, standard textbook educational Telugu (such as standard Hyderabad/Vijayawada teacher Telugu). Avoid colloquial rural slang, heavy regional accents, or informal street vernacular",
+        "native_example": "CPU scheduling అంటే operating system లో processes కి CPU time allocate చేసే విధానం, like FCFS మరియు Round Robin algorithms.",
+        "native_fallback": "క్షమించండి, ప్రస్తుతం సమాధానం పొందలేకపోయాను. దయచేసి మళ్ళీ అడగండి.",
+        "roman_style": "Tinglish (conversational Telugu written in Latin/English script)",
+        "roman_example": "CPU scheduling ante operating system lo processes ki CPU time allocate chese mechanism, like FCFS mariyu Round Robin algorithms.",
+        "roman_fallback": "Sorry, ippudu answer fetch avvaledu. Please malli adagandi.",
+    },
+    "ta-IN": {
+        "name": "Tamil",
+        "script_name": "Tamil script (தமிழ்)",
+        "teacher_dialect": "neutral, polite, standard educational Tamil (standard Chennai/Madurai teacher Tamil). Avoid rural dialect, heavy local slang, or informal street vernacular",
+        "native_example": "Deadlock என்பது operating system-ல் இரண்டு processes resources-க்காக wait பண்ணி block ஆகும் situation, இதை Banker's algorithm மூலம் handle பண்ணலாம்.",
+        "native_fallback": "மன்னிக்கவும், இப்போது பதில் பெற முடியவில்லை. தயவுசெய்து மீண்டும் கேளுங்கள்.",
+        "roman_style": "Tanglish (conversational Tamil written in Latin/English script)",
+        "roman_example": "Deadlock na operating system-la rendu processes resource kaaga wait panni block aaguradhu, idhai Banker's algorithm use panni handle panlaam.",
+        "roman_fallback": "Sorry, ippo answer fetch panna mudiyala. Please marubadiyum kelunga.",
+    },
+    "hi-IN": {
+        "name": "Hindi",
+        "script_name": "Devanagari script (हिन्दी)",
+        "teacher_dialect": "clear, polite, standard educational Hindi (standard teacher Hindi). Avoid rural slang or informal street vernacular",
+        "native_example": "CPU scheduling एक mechanism है जिसमें operating system processes को CPU time allocate करता है, जैसे Round Robin और FCFS algorithms.",
+        "native_fallback": "माफ़ कीजिए, अभी उत्तर नहीं मिल पाया। कृपया फिर से पूछिए।",
+        "roman_style": "Hinglish (conversational Hindi written in Latin/English script)",
+        "roman_example": "CPU scheduling ek mechanism hai jisme operating system processes ko CPU time allocate karta hai, jaise Round Robin aur FCFS algorithms.",
+        "roman_fallback": "Sorry, abhi answer fetch nahi ho paya. Please phir se poochiye.",
+    },
+    "bn-IN": {
+        "name": "Bengali",
+        "script_name": "Bengali script (বাংলা)",
+        "teacher_dialect": "clean, polite, standard educational Bengali (standard Kolkata teacher Bengali). Avoid colloquial rural slang or informal street vernacular",
+        "native_example": "Virtual memory operating system এর একটি technique যেখানে RAM কম থাকলেও secondary storage কে main memory হিসেবে use করা হয়.",
+        "native_fallback": "দুঃখিত, এখন উত্তর পাওয়া যায়নি। দয়া করে আবার জিজ্ঞাসা করুন।",
+        "roman_style": "Benglish (conversational Bengali written in Latin/English script)",
+        "roman_example": "Virtual memory operating system er emon ekta technique jekhane RAM kom thakleo secondary storage ke main memory hishebe use kora hoy.",
+        "roman_fallback": "Sorry, ekhon answer fetch kora jayni. Please abar jiggesh korun.",
+    },
+    "kn-IN": {
+        "name": "Kannada",
+        "script_name": "Kannada script (ಕನ್ನಡ)",
+        "teacher_dialect": "clear, polite, standard educational Kannada (standard teacher Kannada). Avoid colloquial rural slang",
+        "native_example": "CPU scheduling ಎಂಬುದು operating system-ನಲ್ಲಿ processes ಗೆ CPU time allocate ಮಾಡುವ mechanism, like Round Robin ಮತ್ತು FCFS algorithms.",
+        "native_fallback": "ಕ್ಷಮಿಸಿ, ಈಗ ಉತ್ತರ ಪಡೆಯಲು ಸಾಧ್ಯವಾಗಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಮತ್ತೆ ಕೇಳಿ.",
+        "roman_style": "Kanglish (conversational Kannada written in Latin/English script)",
+        "roman_example": "CPU scheduling andre operating system-alli processes ge CPU time allocate maduva mechanism, like Round Robin mathu FCFS algorithms.",
+        "roman_fallback": "Sorry, ivaga answer fetch agalilla. Please matte keli.",
+    },
+    "ml-IN": {
+        "name": "Malayalam",
+        "script_name": "Malayalam script (മലയാളം)",
+        "teacher_dialect": "clear, polite, standard educational Malayalam (standard teacher Malayalam). Avoid colloquial rural slang",
+        "native_example": "CPU scheduling എന്നത് operating system-ൽ processes-ന് CPU time allocate ചെയ്യുന്ന mechanism ആണ്, like Round Robin algorithms.",
+        "native_fallback": "ക്ഷമിക്കണം, ഇപ്പോൾ ഉത്തരം ലഭ്യമാക്കാൻ കഴിഞ്ഞില്ല. ദയവായി വീണ്ടും ചോദിക്കുക.",
+        "roman_style": "Manglish (conversational Malayalam written in Latin/English script)",
+        "roman_example": "CPU scheduling ennal operating system-il processes-inu CPU time allocate cheyyunna mechanism aanu, like Round Robin algorithms.",
+        "roman_fallback": "Sorry, ippo answer fetch cheyyan pattiyilla. Please veendum chodikku.",
+    },
+    "mr-IN": {
+        "name": "Marathi",
+        "script_name": "Devanagari script (मराठी)",
+        "teacher_dialect": "clear, polite, standard educational Marathi (standard teacher Marathi). Avoid colloquial rural slang",
+        "native_example": "CPU scheduling म्हणजे operating system मध्ये processes ना CPU time allocate करणारी mechanism, जसे Round Robin algorithms.",
+        "native_fallback": "क्षमस्व, आता उत्तर मिळू शकले नाही. कृपया पुन्हा विचारा.",
+        "roman_style": "Conversational Marathi in Latin/English script mixed with English",
+        "roman_example": "CPU scheduling mhanje operating system madhye processes na CPU time allocate karnari mechanism, jase Round Robin algorithms.",
+        "roman_fallback": "Sorry, ata answer fetch zala nahi. Please punha vichara.",
+    },
+    "gu-IN": {
+        "name": "Gujarati",
+        "script_name": "Gujarati script (ગુજરાતી)",
+        "teacher_dialect": "clear, polite, standard educational Gujarati. Avoid colloquial rural slang",
+        "native_example": "CPU scheduling એટલે operating system માં processes ને CPU time allocate કરવાની mechanism, જેમ કે Round Robin algorithms.",
+        "native_fallback": "માફ કરશો, અત્યારે જવાબ મળી શક્યો નથી. કૃપા કરીને ફરી પૂછો.",
+        "roman_style": "Conversational Gujarati in Latin/English script mixed with English",
+        "roman_example": "CPU scheduling etle operating system ma processes ne CPU time allocate karvano mechanism, jem ke Round Robin algorithms.",
+        "roman_fallback": "Sorry, atyare answer fetch thai shakyo nathi. Please fari pucho.",
+    },
+    "pa-IN": {
+        "name": "Punjabi",
+        "script_name": "Gurmukhi script (ਪੰਜਾਬੀ)",
+        "teacher_dialect": "clear, polite, standard educational Punjabi. Avoid colloquial rural slang",
+        "native_example": "CPU scheduling ਇਕ mechanism ਹੈ ਜਿਸ ਰਾਹੀਂ operating system processes ਨੂੰ CPU time allocate ਕਰਦਾ ਹੈ, ਜਿਵੇਂ Round Robin algorithms.",
+        "native_fallback": "ਮਾਫ਼ ਕਰਨਾ, ਹੁਣ ਜਵਾਬ ਨਹੀਂ ਮਿਲ ਸਕਿਆ। ਕਿਰਪਾ ਕਰਕੇ ਦੁਬਾਰਾ ਪੁੱਛੋ।",
+        "roman_style": "Conversational Punjabi in Latin/English script mixed with English",
+        "roman_example": "CPU scheduling ik mechanism hai jis naal operating system processes nu CPU time allocate karda hai, jiwe Round Robin algorithms.",
+        "roman_fallback": "Sorry, hun answer fetch nahi ho sakya. Please phir pucho.",
+    },
+    "od-IN": {
+        "name": "Odia",
+        "script_name": "Odia script (ଓଡ଼ିଆ)",
+        "teacher_dialect": "clear, polite, standard educational Odia. Avoid colloquial rural slang",
+        "native_example": "CPU scheduling ହେଉଛି operating system ରେ processes କୁ CPU time allocate କରିବା mechanism, ଯେମିତି Round Robin algorithms.",
+        "native_fallback": "କ୍ଷମା କରିବେ, ବର୍ତ୍ତମାନ ଉତ୍ତର ମିଳିପାରିଲା ନାହିଁ। ଦୟାକରି ପୁଣି ପଚାରନ୍ତୁ।",
+        "roman_style": "Conversational Odia in Latin/English script mixed with English",
+        "roman_example": "CPU scheduling heuchi operating system re processes ku CPU time allocate kariba mechanism, jemiti Round Robin algorithms.",
+        "roman_fallback": "Sorry, ebe answer fetch heiparila nahi. Please puni pacharantu.",
+    },
+    "en-IN": {
+        "name": "English",
+        "script_name": "Latin script (English)",
+        "teacher_dialect": "clear, concise, polite Indian English",
+        "native_example": "CPU scheduling is the operating system mechanism that allocates CPU time to ready processes using algorithms like FCFS and Round Robin.",
+        "native_fallback": "Sorry, I could not fetch the answer. Please ask again.",
+        "roman_style": "Clear, concise Indian English",
+        "roman_example": "CPU scheduling is the operating system mechanism that allocates CPU time to ready processes using algorithms like FCFS and Round Robin.",
+        "roman_fallback": "Sorry, I could not fetch the answer. Please ask again.",
+    },
 }
-DEFAULT_PROFILE: dict[str, str] = {
-    "name": "Telugu",
-    "style": "Tinglish (conversational Telugu written in Latin/English script)",
-    "example": "CPU scheduling ante operating system lo processes ki CPU time allocate chese mechanism, like FCFS mariyu Round Robin algorithms.",
-    "fallback": "Sorry, ippudu answer fetch avvaledu. Please malli adagandi.",
-}
+
+DEFAULT_PROFILE: dict[str, str] = LANGUAGE_PROFILES["te-IN"]
 _LANGUAGE_PROFILES_BY_NORMALIZED_CODE = {code.lower(): profile for code, profile in LANGUAGE_PROFILES.items()}
 
 VERNACULAR_KEYWORD_PATTERNS = {
-    "te-IN": re.compile(r"\b(ante|enti|ela|mariyu|lo|unna|chese|cheppandi|cheyadam|kadha|gurinchi|enduku|chesukondi)\b", re.IGNORECASE),
-    "ta-IN": re.compile(r"\b(enna|epdi|adha|pannuvanga|solunga|la|kaaga|irukku|enna-na|panlaam)\b", re.IGNORECASE),
-    "bn-IN": re.compile(r"\b(ki|bhabe|kaaj|kore|bolun|ekta|jekhane|kora|hoy)\b", re.IGNORECASE),
-    "hi-IN": re.compile(r"\b(kya|kaise|hota|hoti|hai|bataiye|batao|karte|jisme|karega)\b", re.IGNORECASE),
+    "te-IN": re.compile(r"[\u0C00-\u0C7F]|\b(ante|enti|ela|mariyu|lo|unna|chese|cheppandi|cheyadam|kadha|gurinchi|enduku|chesukondi)\b", re.IGNORECASE),
+    "ta-IN": re.compile(r"[\u0B80-\u0BFF]|\b(enna|epdi|adha|pannuvanga|solunga|la|kaaga|irukku|enna-na|panlaam)\b", re.IGNORECASE),
+    "bn-IN": re.compile(r"[\u0980-\u09FF]|\b(ki|bhabe|kaaj|kore|bolun|ekta|jekhane|kora|hoy)\b", re.IGNORECASE),
+    "hi-IN": re.compile(r"[\u0900-\u097F]|\b(kya|kaise|hota|hoti|hai|bataiye|batao|karte|jisme|karega)\b", re.IGNORECASE),
 }
 
+VOICE_AGENT_NATIVE_SYSTEM_PROMPT = """
+You are an ultra-fast, conversational AI voice tutor answering live telephone calls for rural and semi-urban students ("Shiksha Vani").
 
-VOICE_AGENT_SYSTEM_PROMPT = """
-You are an ultra-fast, conversational AI voice tutor answering live phone calls for rural students ("Shiksha Vani").
+STRICT CRITICAL RULES:
+1. Script & Transliteration Requirement:
+   - For regional Indian languages (Telugu, Tamil, Hindi, Bengali, etc.), OUTPUT IN CLEAN NATIVE UNICODE SCRIPT (e.g. Telugu script తెలుగు for te-IN, Tamil script தமிழ் for ta-IN, Devanagari हिन्दी for hi-IN, Bengali বাংলা for bn-IN).
+   - ALL academic, technical, IT, computing, and scientific acronyms and terms MUST REMAIN IN ENGLISH LATIN SCRIPT (e.g., CPU, RAM, Process, Thread, Operating System, Scheduling, Deadlock, Algorithm, Round Robin, FCFS, Virtual Memory, Database, Cache, Hardware, Photosynthesis).
+   - DO NOT transliterate technical terms into Indic characters (e.g., write "operating system", NOT "ఆపరేటింగ్ సిస్టమ్"; write "processes", NOT "ప్రాసెస్లు"; write "algorithms", NOT "అల్గోరిథమ్స్").
+   - Retain English technical vocabulary in English Latin script, while all connecting words, grammar, and explanations must be in clean, polite native script.
+
+2. Standard Teacher Tone & Polite Dialect:
+   - Speak in neutral, polite, standard textbook educational dialect (such as standard Hyderabad/Vijayawada teacher Telugu for te-IN, standard Chennai/Madurai teacher Tamil for ta-IN, standard teacher Hindi for hi-IN).
+   - Avoid colloquial rural slang, heavy countryside regional accents, or informal street vernacular.
+   - Speak clearly, warmly, and politely as a knowledgeable school teacher addressing a student.
+   - Examples of standard teacher explanations:
+     * Telugu (te-IN): "CPU scheduling అంటే operating system లో processes కి CPU time allocate చేసే విధానం, like FCFS మరియు Round Robin algorithms."
+     * Tamil (ta-IN): "Deadlock என்பது operating system-ல் இரண்டு processes resources-க்காக wait பண்ணி block ஆகும் situation, இதை Banker's algorithm மூலம் handle பண்ணலாம்."
+     * Hindi (hi-IN): "CPU scheduling एक mechanism है जिसमें operating system processes को CPU time allocate करता है, जैसे Round Robin और FCFS algorithms."
+     * Bengali (bn-IN): "Virtual memory operating system এর একটি technique যেখানে RAM কম থাকলেও secondary storage কে main memory হিসেবে use করা হয়."
+
+3. Spoken Brevity and Phone Call Format:
+   - Keep answers strictly to 1 to 2 concise spoken sentences (25 to 35 words maximum).
+   - Ensure the explanation is warm, clear, and sounds natural over telephone audio.
+   - Never stop mid-thought; always finish the final sentence cleanly with punctuation (. or !).
+   - ABSOLUTELY NO bullet points, lists, numbered items, Markdown formatting, asterisks, or emojis.
+""".strip()
+
+VOICE_AGENT_ROMAN_SYSTEM_PROMPT = """
+You are an ultra-fast, conversational AI voice tutor answering live telephone calls for rural students ("Shiksha Vani").
 
 STRICT CRITICAL RULES:
 1. Script & Transliteration Requirement:
    - OUTPUT ONLY IN PLAIN ASCII LATIN/ENGLISH SCRIPT (Roman transliteration).
-   - NEVER output native Indic scripts (NO Telugu script తెలుగు, NO Devanagari हिन्दी, NO Tamil script தமிழ், NO Bengali script বাংলা).
-   - The phone TTS system expects pure Roman alphabet Latin text (e.g., "ante", "cheppandi", "karega", "panlaam").
+   - NEVER output native Indic scripts. The phone TTS system expects pure Roman alphabet Latin text (e.g., "ante", "cheppandi", "karega", "panlaam").
 
 2. Natural Code-Mixed Vernacular + English Technical Terms:
    - When speaking regional languages (Telugu, Tamil, Hindi, Bengali, etc.), speak in NATURAL CONVERSATIONAL CODE-MIXED style (e.g., Tinglish, Tanglish, Hinglish, Benglish).
@@ -83,28 +208,65 @@ STRICT CRITICAL RULES:
 """.strip()
 
 
+def get_voice_agent_system_prompt() -> str:
+    return VOICE_AGENT_NATIVE_SYSTEM_PROMPT if _is_native_script_mode() else VOICE_AGENT_ROMAN_SYSTEM_PROMPT
+
+
 def get_language_profile(language_code: str | None) -> dict[str, str]:
     """Return a case-insensitive caller-language profile, with a safe default."""
     normalized = str(language_code or "").strip().lower()
-    return _LANGUAGE_PROFILES_BY_NORMALIZED_CODE.get(normalized, DEFAULT_PROFILE)
+    raw_profile = _LANGUAGE_PROFILES_BY_NORMALIZED_CODE.get(normalized, DEFAULT_PROFILE)
+    profile = raw_profile.copy()
+    if _is_native_script_mode():
+        profile["style"] = f"clean {profile.get('script_name', 'native script')} with English technical terms in Latin script"
+        profile["example"] = profile.get("native_example", "")
+        profile["fallback"] = profile.get("native_fallback", "")
+    else:
+        profile["style"] = profile.get("roman_style", "")
+        profile["example"] = profile.get("roman_example", "")
+        profile["fallback"] = profile.get("roman_fallback", "")
+    return profile
 
 
 def _language_style_instruction(language_code: str) -> str:
     """Tell the LLM exactly how the phone caller should hear the answer."""
     profile = get_language_profile(language_code)
+    is_native = _is_native_script_mode()
+    teacher_dialect = profile.get("teacher_dialect", "polite, standard textbook educational language")
     example = profile.get("example", "")
+
     if profile["name"] == "English":
         settings = get_settings()
         default_lang = getattr(settings, "default_caller_language", "te-IN")
         if default_lang and default_lang != "en-IN":
             def_profile = get_language_profile(default_lang)
+            if is_native:
+                return (
+                    f"The caller is a regional student who may ask questions using English technical words. "
+                    f"Respond in {def_profile.get('teacher_dialect', 'standard educational dialect')}. "
+                    f"MANDATORY: Output vernacular explanation in clean {def_profile.get('script_name', 'native script')}, "
+                    f"while keeping ALL academic and technical terms in English Latin script. "
+                    f"Example response style: \"{def_profile.get('example', '')}\". Keep to 1-2 spoken sentences."
+                )
             return (
                 f"The caller is a regional student who may ask questions using English technical words. "
                 f"Respond in natural conversational {def_profile['style']} where all technical terms remain in English. "
                 f"MANDATORY: Output ONLY in Roman/Latin script (ASCII English letters), NEVER in native script! "
                 f"Example response style: \"{def_profile.get('example', '')}\". Keep to 1-2 spoken sentences."
             )
-        return "The caller spoke English. Respond in concise, clear English in 1-2 spoken sentences."
+        return "The caller spoke English. Respond in concise, clear, polite Indian English in 1-2 spoken sentences."
+
+    if is_native:
+        return (
+            f"DETECTED CALLER LANGUAGE IS {profile['name'].upper()} ({language_code}). "
+            f"Respond in {teacher_dialect}. "
+            f"MANDATORY: Output vernacular explanation in clean {profile.get('script_name', 'native script')}. "
+            f"Keep ALL academic, computing, and technical terms in English Latin script (e.g. CPU, Process, Scheduling, Deadlock, Algorithm, Memory, RAM). "
+            f"DO NOT transliterate technical terms into Indic script. "
+            f"Example response style: \"{example}\". "
+            f"Keep response to 1-2 concise spoken sentences (under 35 words)."
+        )
+
     return (
         f"DETECTED CALLER LANGUAGE OVERRIDES the translated English query: {profile['name']} ({language_code}). "
         f"You MUST respond in {profile['style']}. "
@@ -301,7 +463,7 @@ REQUIRED RESPONSE LANGUAGE AND SCRIPT:
 
 
 def _voice_system_message(language_code: str) -> str:
-    return f"{VOICE_AGENT_SYSTEM_PROMPT}\n\n{_language_style_instruction(language_code)}"
+    return f"{get_voice_agent_system_prompt()}\n\n{_language_style_instruction(language_code)}"
 
 
 def _general_groq_messages(
@@ -309,7 +471,7 @@ def _general_groq_messages(
 ) -> list[dict[str, str]]:
     """Build direct-Groq messages for questions outside the supplied PDFs."""
     system_message = f"""
-{VOICE_AGENT_SYSTEM_PROMPT}
+{get_voice_agent_system_prompt()}
 
 {_language_style_instruction(language_code)}
 

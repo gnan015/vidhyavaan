@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import httpx
+import numpy as np
 
 from app.core.config import Settings, get_settings
 
@@ -92,12 +93,20 @@ def _require_service_id(value: str | None, name: str) -> str:
 def _mock_query_for(text: str, language_code: str) -> str:
     known = {
         "operating system lo scheduling algorithms ante enti?": "What are scheduling algorithms in operating systems?",
+        "operating system లో scheduling algorithms అంటే ఏమిటి?": "What are scheduling algorithms in operating systems?",
+        "operating system లో scheduling algorithms అంటే enti?": "What are scheduling algorithms in operating systems?",
+        "operating system అంటే": "What is operating system?",
+        "cpu scheduling అంటే": "What is CPU scheduling in operating systems?",
         "operating system-la deadlock na enna, adha epdi handle pannuvanga?": "What is deadlock in operating systems and how is it handled?",
+        "operating system-ல் deadlock என்றால் என்ன, அதை எப்படி handle பண்ணுவாங்க?": "What is deadlock in operating systems and how is it handled?",
+        "deadlock என்பது": "What is deadlock in operating systems?",
         "operating system e virtual memory ki bhabe kaaj kore?": "How does virtual memory work in operating systems?",
+        "operating system এ virtual memory কিভাবে কাজ করে?": "How does virtual memory work in operating systems?",
+        "virtual memory হলো": "How does virtual memory work in operating systems?",
     }
     clean = text.strip().lower()
     for pattern, english in known.items():
-        if pattern in clean or clean in pattern:
+        if pattern.lower() in clean or clean in pattern.lower():
             return english
     return text.strip()
 
@@ -574,64 +583,92 @@ async def synthesize_speech(text: str, sample_rate: int, language_code: str = "e
         raise
 
 
+def _resample_audio_polyphase(samples: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    """Anti-aliased polyphase FIR filter downsampling to eliminate metallic/scratchy artifacts."""
+    if source_rate == target_rate or len(samples) == 0:
+        return samples
+    try:
+        from scipy.signal import resample_poly
+        gcd = math.gcd(int(target_rate), int(source_rate))
+        up = int(target_rate) // gcd
+        down = int(source_rate) // gcd
+        return resample_poly(samples, up, down).astype(np.float32)
+    except Exception as exc:
+        logger.warning("resample_poly_fallback error=%s", exc)
+        num_target = int(round(len(samples) * target_rate / source_rate))
+        orig_idx = np.linspace(0, len(samples) - 1, len(samples))
+        target_idx = np.linspace(0, len(samples) - 1, num_target)
+        return np.interp(target_idx, orig_idx, samples).astype(np.float32)
+
+
 def tts_audio_to_pcm16(audio: bytes, target_sample_rate: int) -> bytes:
-    """Convert Bhashini WAV output to Exotel's mono signed 16-bit PCM."""
+    """Convert Bhashini WAV output to Exotel's mono signed 16-bit PCM with anti-aliasing."""
     if not audio:
         return b""
 
-    # Handle standard WAV formats (including format 1 PCM and format 3 IEEE Float)
+    # Handle WAV containers (format 1 PCM or format 3 IEEE Float)
     if len(audio) >= 44 and audio[:4] == b"RIFF" and audio[8:12] == b"WAVE":
+        fmt_pos = audio.find(b"fmt ")
+        data_pos = audio.find(b"data")
+        if fmt_pos != -1 and data_pos != -1:
+            try:
+                fmt_len = struct.unpack("<I", audio[fmt_pos + 4 : fmt_pos + 8])[0]
+                fmt_data = audio[fmt_pos + 8 : fmt_pos + 8 + fmt_len]
+                fmt_tag, channels, source_rate, _, _, bits_per_sample = struct.unpack(
+                    "<HHIIHH", fmt_data[:16]
+                )
+                data_len = struct.unpack("<I", audio[data_pos + 4 : data_pos + 8])[0]
+                raw_data = audio[data_pos + 8 : data_pos + 8 + data_len]
+
+                floats: np.ndarray | None = None
+                if fmt_tag == 3 and bits_per_sample == 32:
+                    floats = np.frombuffer(raw_data, dtype=np.float32).copy()
+                    if channels == 2:
+                        floats = (floats[0::2] + floats[1::2]) * 0.5
+                elif fmt_tag == 1 and bits_per_sample == 16:
+                    ints = np.frombuffer(raw_data, dtype=np.int16)
+                    if channels == 2:
+                        ints_mono = (ints[0::2].astype(np.float32) + ints[1::2].astype(np.float32)) * 0.5
+                        floats = ints_mono / 32768.0
+                    else:
+                        floats = ints.astype(np.float32) / 32768.0
+
+                if floats is not None and len(floats) > 0:
+                    # Remove DC bias to prevent pops and asymmetric distortion on phone speakers
+                    floats = floats - np.mean(floats)
+                    # High quality anti-aliased resampling to target rate (e.g. 16k/24k/22.05k -> 8k)
+                    if source_rate != target_sample_rate:
+                        floats = _resample_audio_polyphase(floats, source_rate, target_sample_rate)
+                    # Peak normalization & gentle soft limiting for clear, warm telephone audio
+                    peak = float(np.max(np.abs(floats))) if len(floats) else 0.0
+                    if peak > 0.001:
+                        target_peak = 0.90
+                        scale = target_peak / max(peak, 1e-5)
+                        floats = floats * min(scale, 2.0)
+                    pcm16 = np.clip(floats * 32767.0, -32768, 32767).astype(np.int16)
+                    return pcm16.tobytes()
+            except Exception as exc:
+                logger.warning("numpy_wav_resample_failed error=%s", exc)
+
+        # Standard library wave reader fallback for standard PCM16 WAV
         try:
             with wave.open(io.BytesIO(audio), "rb") as source:
                 channels = source.getnchannels()
                 sample_width = source.getsampwidth()
                 source_rate = source.getframerate()
                 frames = source.readframes(source.getnframes())
-                if sample_width == 2 and channels == 1:
+                if sample_width == 2:
+                    pcm_data = np.frombuffer(frames, dtype=np.int16)
+                    if channels == 2:
+                        pcm_data = ((pcm_data[0::2].astype(np.float32) + pcm_data[1::2].astype(np.float32)) * 0.5).astype(np.int16)
                     if source_rate == target_sample_rate:
-                        return frames
-                    converted, _ = audioop.ratecv(frames, 2, 1, source_rate, target_sample_rate, None)
-                    return converted
+                        return pcm_data.tobytes()
+                    floats = pcm_data.astype(np.float32) / 32768.0
+                    floats = floats - np.mean(floats)
+                    floats = _resample_audio_polyphase(floats, source_rate, target_sample_rate)
+                    return np.clip(floats * 32767.0, -32768, 32767).astype(np.int16).tobytes()
         except Exception:
             pass
-
-        # Parse IEEE Float 32-bit (format tag 3) or non-standard chunk headers
-        try:
-            fmt_pos = audio.find(b"fmt ")
-            if fmt_pos != -1:
-                fmt_len = struct.unpack("<I", audio[fmt_pos + 4 : fmt_pos + 8])[0]
-                fmt_data = audio[fmt_pos + 8 : fmt_pos + 8 + fmt_len]
-                fmt_tag, channels, source_rate, avg_bytes, block_align, bits_per_sample = struct.unpack(
-                    "<HHIIHH", fmt_data[:16]
-                )
-
-                data_pos = audio.find(b"data")
-                if data_pos != -1:
-                    data_len = struct.unpack("<I", audio[data_pos + 4 : data_pos + 8])[0]
-                    raw_data = audio[data_pos + 8 : data_pos + 8 + data_len]
-
-                    if fmt_tag == 3 and bits_per_sample == 32:
-                        num_floats = len(raw_data) // 4
-                        floats = struct.unpack(f"<{num_floats}f", raw_data[: num_floats * 4])
-                        if channels == 2:
-                            mono_floats = [(floats[i] + floats[i + 1]) / 2 for i in range(0, len(floats) - 1, 2)]
-                        else:
-                            mono_floats = floats
-                        pcm16_samples = [max(-32768, min(32767, int(s * 32767.0))) for s in mono_floats]
-                        frames = struct.pack(f"<{len(pcm16_samples)}h", *pcm16_samples)
-                        if source_rate == target_sample_rate:
-                            return frames
-                        converted, _ = audioop.ratecv(frames, 2, 1, source_rate, target_sample_rate, None)
-                        return converted
-
-                    if fmt_tag == 1 and bits_per_sample == 16:
-                        frames = raw_data
-                        if source_rate == target_sample_rate:
-                            return frames
-                        converted, _ = audioop.ratecv(frames, 2, 1, source_rate, target_sample_rate, None)
-                        return converted
-        except Exception as exc:
-            logger.warning("wav_parse_fallback_failed error=%s", exc)
 
     # Raw PCM fallback if already PCM frames
     if len(audio) % 2 == 0:

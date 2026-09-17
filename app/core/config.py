@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     bhashini_inference_url: str = "https://dhruva-api.bhashini.gov.in/services/inference/pipeline"
     bhashini_request_timeout_seconds: float = 60.0
     bhashini_tts_gender: str = "female"
+    bhashini_tts_script_mode: str = "native"
     bhashini_mock_fallback: bool = True
     default_caller_language: str = "te-IN"
     server_base_url: str | None = None

@@ -23,6 +23,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+with contextlib.suppress(Exception):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
+
 import httpx
 import websockets
 
@@ -197,19 +202,26 @@ def report_case(case: VoicebotCase, report: TestReport, silence_started_at: floa
 
     print(f"\n=== {case.language_code} voicebot report ===")
     print(f"Input Audio: {case.input_path} ({wav_duration_seconds(case.input_path):.2f}s)")
+    settings = get_settings()
+    script_mode = getattr(settings, "bhashini_tts_script_mode", "native")
     print(f"Detected Language: {detected_language}")
     print(f"Detected Question: {detected_question}")
     print(f"Query Route: {route}")
     print(f"Response Text: {response_text}")
-    print(f"Roman transliteration: {'yes' if is_roman else 'no'}")
+    print(f"Script Mode: {script_mode}")
+    print(f"Script Format Check: {'Roman transliterated (ASCII)' if is_roman else 'Native Indic Unicode'}")
     print(f"English technical terms retained: {', '.join(terms) or 'none found'}")
     print(f"Output Audio: {case.output_path} ({case.output_path.stat().st_size:,} bytes, {wav_duration_seconds(case.output_path):.2f}s)")
     print(f"Turnaround Latency: {latency:.2f}s" if latency is not None else "Turnaround Latency: not available")
 
     if detected_language != case.language_code:
         raise AssertionError(f"Expected language {case.language_code}, received {detected_language}")
-    if not is_roman:
-        raise AssertionError("Expected a Roman-transliterated answer")
+    if script_mode == "roman":
+        if not is_roman:
+            raise AssertionError("Expected a Roman-transliterated answer")
+    else:
+        if not response_text.strip():
+            raise AssertionError("Expected a non-empty native script answer")
     if not terms:
         raise AssertionError(f"No expected English technical term was retained: {case.technical_terms}")
 
