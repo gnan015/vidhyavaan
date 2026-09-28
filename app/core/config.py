@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     app_name: str = "Exotel Inbound Audio Service"
     environment: str = "development"
     log_level: str = "INFO"
+    sarvam_api_key: str = Field(default="", repr=False)
+    sarvam_tts_model: str = "bulbul:v3"
+    sarvam_stt_model: str = "saaras:v3"
+    sarvam_speaker: str = "kavitha"
     exotel_webhook_token: str | None = Field(default=None, repr=False)
     exotel_signature_secret: str | None = Field(default=None, repr=False)
     bhashini_user_id: str | None = Field(default=None, repr=False)
@@ -31,14 +35,12 @@ class Settings(BaseSettings):
     bhashini_tts_gender: str = "female"
     bhashini_tts_script_mode: str = "native"
     bhashini_mock_fallback: bool = True
-    default_caller_language: str = "te-IN"
+    default_caller_language: str = "en-IN"
     server_base_url: str | None = None
     vad_rms_threshold: int = 400
-    # Trigger the voice turn shortly after the caller finishes a sentence.
-    vad_silence_seconds: float = 0.9
-    # Groq completed the observed live RAG request in about 4.6 seconds;
-    # retain a modest margin instead of discarding a valid answer prematurely.
-    rag_query_timeout_seconds: float = 8.0
+    # Trigger the voice turn promptly (550ms) after the caller finishes speaking.
+    vad_silence_seconds: float = 0.55
+    rag_query_timeout_seconds: float = 6.0
     # Use the attached knowledge base and LLM to answer the caller's question.
     live_rag_enabled: bool = True
     # Used only when the textbook retrieval has no sufficiently relevant context.

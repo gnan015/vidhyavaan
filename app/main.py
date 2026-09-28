@@ -8,6 +8,7 @@ from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.routes.exotel import router as exotel_router
 from app.services.bhashini import close_bhashini_client
+from app.services.sarvam import close_sarvam_client
 from app.services.rag_middleware import close_groq_client, warm_rag_index
 
 settings = get_settings()
@@ -23,6 +24,7 @@ async def lifespan(_: FastAPI):
         yield
     finally:
         await close_groq_client()
+        await close_sarvam_client()
         await close_bhashini_client()
 
 

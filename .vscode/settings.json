@@ -1,0 +1,8 @@
+{
+  "python.analysis.extraPaths": [
+    "./app/rag_core"
+  ],
+  "python.autoComplete.extraPaths": [
+    "./app/rag_core"
+  ]
+}

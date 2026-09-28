@@ -145,7 +145,7 @@ LANGUAGE_PROFILES: dict[str, dict[str, str]] = {
     },
 }
 
-DEFAULT_PROFILE: dict[str, str] = LANGUAGE_PROFILES["te-IN"]
+DEFAULT_PROFILE: dict[str, str] = LANGUAGE_PROFILES["en-IN"]
 _LANGUAGE_PROFILES_BY_NORMALIZED_CODE = {code.lower(): profile for code, profile in LANGUAGE_PROFILES.items()}
 
 VERNACULAR_KEYWORD_PATTERNS = {
@@ -175,8 +175,9 @@ STRICT CRITICAL RULES:
      * Hindi (hi-IN): "CPU scheduling एक mechanism है जिसमें operating system processes को CPU time allocate करता है, जैसे Round Robin और FCFS algorithms."
      * Bengali (bn-IN): "Virtual memory operating system এর একটি technique যেখানে RAM কম থাকলেও secondary storage কে main memory হিসেবে use করা হয়."
 
-3. Spoken Brevity and Phone Call Format:
-   - Keep answers strictly to 1 to 2 concise spoken sentences (25 to 35 words maximum).
+3. Spoken Brevity and Low-Latency Phone Call Format:
+   - Keep answers strictly to 1 direct, crisp spoken sentence (15 to 22 words maximum).
+   - Be very concise, educational, and direct so it synthesizes and streams rapidly over telephone lines.
    - Ensure the explanation is warm, clear, and sounds natural over telephone audio.
    - Never stop mid-thought; always finish the final sentence cleanly with punctuation (. or !).
    - ABSOLUTELY NO bullet points, lists, numbered items, Markdown formatting, asterisks, or emojis.
@@ -200,8 +201,9 @@ STRICT CRITICAL RULES:
      * Hindi (Hinglish): "CPU scheduling ek mechanism hai jisme operating system processes ko CPU time allocate karta hai, jaise Round Robin aur FCFS algorithms."
      * Bengali (Benglish): "Virtual memory operating system er emon ekta technique jekhane RAM kom thakleo secondary storage ke main memory hishebe use kora hoy."
 
-3. Spoken Brevity and Phone Call Format:
-   - Keep answers strictly to 1 to 2 concise spoken sentences (25 to 35 words maximum).
+3. Spoken Brevity and Low-Latency Phone Call Format:
+   - Keep answers strictly to 1 direct, crisp spoken sentence (15 to 22 words maximum).
+   - Be very concise, educational, and direct so it synthesizes and streams rapidly over telephone lines.
    - Make it sound warm, encouraging, and natural for a telephone conversation.
    - Never stop mid-thought; always finish the final sentence cleanly with punctuation (. or !).
    - ABSOLUTELY NO bullet points, lists, numbered items, Markdown formatting, asterisks, or emojis.
@@ -410,8 +412,8 @@ def _load_llm() -> tuple[Any, Any]:
     core_path = str(CORE_DIRECTORY)
     if core_path not in sys.path:
         sys.path.insert(0, core_path)
-    from models.llm import GroqLLM
-    from rag.prompts import build_rag_prompt
+    from models.llm import GroqLLM  # type: ignore[import-not-found, import-untyped]
+    from rag.prompts import build_rag_prompt  # type: ignore[import-not-found, import-untyped]
 
     _llm = GroqLLM()
     _build_rag_prompt = build_rag_prompt
@@ -536,18 +538,16 @@ def _clean_spoken_text(text: str) -> str:
 
 
 def _resolve_target_language(query: str, language_code: str) -> str:
-    """Detect vernacular markers if ALD or caller language defaulted to en-IN."""
-    norm = str(language_code or "").strip().lower()
-    # Check if query itself has explicit vernacular words
+    """Detect vernacular markers if present in query, otherwise honor detected language or default to en-IN."""
+    # Check if query itself has explicit vernacular words/script
     for code, pattern in VERNACULAR_KEYWORD_PATTERNS.items():
         if pattern.search(query):
             return code
-    if norm in {"", "en-in", "en"}:
+    norm = str(language_code or "").strip().lower()
+    if norm in {"", "unknown"}:
         settings = get_settings()
-        default_lang = getattr(settings, "default_caller_language", "te-IN")
-        if default_lang and default_lang.lower() not in {"en-in", "en"}:
-            return default_lang
-    return language_code or "te-IN"
+        return getattr(settings, "default_caller_language", "en-IN") or "en-IN"
+    return language_code or "en-IN"
 
 
 def _query_textbook_sync(

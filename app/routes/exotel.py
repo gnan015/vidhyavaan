@@ -15,17 +15,18 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, status
+from starlette.websockets import WebSocketState
 from pydantic import ValidationError
 
 from app.core.config import Settings, get_settings
 from app.schemas.exotel import AudioFrameInfo, ExotelCallback
 from app.services.audio import process_audio_frame
 from app.services.recordings import download_and_process_recording, validate_recording_url
-from app.services.bhashini import (
-    synthesize_speech,
-    transcribe_and_translate_audio,
-    transcribe_and_translate_wav,
-    tts_audio_to_pcm16,
+from app.services.sarvam import (
+    sarvam_audio_to_pcm16,
+    synthesize_speech_sarvam,
+    transcribe_audio_file_sarvam,
+    transcribe_audio_sarvam,
 )
 from app.services.rag_middleware import get_language_profile, query_rag
 from app.services.security import verify_exotel_request
@@ -57,6 +58,40 @@ def _stream_recording_path(call_sid: str | None) -> Path:
 def _fallback_response(language_code: str) -> str:
     """Return conversational recovery speech for the detected caller language."""
     return get_language_profile(language_code)["fallback"]
+
+
+FILLERS_DIRECTORY = Path(__file__).resolve().parents[1] / "assets" / "fillers"
+_CACHED_FILLERS: dict[str, bytes] = {}
+
+
+def _get_filler_pcm(language_code: str = "en-IN") -> bytes:
+    """Return pre-synthesized conversational acknowledgment PCM audio."""
+    norm = language_code.strip()
+    if norm not in _CACHED_FILLERS:
+        filler_path = FILLERS_DIRECTORY / f"{norm}.pcm"
+        if not filler_path.is_file():
+            filler_path = FILLERS_DIRECTORY / "en-IN.pcm"
+        if filler_path.is_file():
+            _CACHED_FILLERS[norm] = filler_path.read_bytes()
+        else:
+            _CACHED_FILLERS[norm] = b""
+    return _CACHED_FILLERS.get(norm, b"")
+
+
+def _trim_trailing_silence(audio: bytes, sample_rate: int, keep_silence_ms: int = 120) -> bytes:
+    """Trim silence frames at the end of an utterance to speed up STT upload and inference."""
+    frame_size = sample_rate * 2 // 10  # 100ms
+    if len(audio) <= frame_size * 2:
+        return audio
+    keep_bytes = (sample_rate * 2 * keep_silence_ms) // 1000
+    threshold = 300
+    last_sound_idx = len(audio)
+    for idx in range(len(audio) - frame_size, 0, -frame_size):
+        chunk = audio[idx : idx + frame_size]
+        if _pcm_rms(chunk) >= threshold:
+            last_sound_idx = min(len(audio), idx + frame_size + keep_bytes)
+            break
+    return audio[:last_sound_idx]
 
 
 def _sample_rate_from_media_format(media_format: object) -> int:
@@ -118,12 +153,12 @@ def _write_stream_wav(
 def _schedule_transcription(audio_path: Path, call_sid: str | None) -> None:
     """Keep the post-call network task alive without delaying socket teardown."""
     task = asyncio.create_task(
-        transcribe_and_translate_audio(str(audio_path)), name="bhashini-transcription"
+        transcribe_audio_file_sarvam(str(audio_path)), name="sarvam-transcription"
     )
     _transcription_tasks.add(task)
     task.add_done_callback(_transcription_tasks.discard)
     logger.info(
-        "bhashini_transcription_scheduled",
+        "sarvam_transcription_scheduled",
         extra={"call_sid": call_sid, "recording_path": str(audio_path), "event": "transcription"},
     )
 
@@ -174,7 +209,7 @@ def _pcm_rms(audio: bytes) -> float:
 
 
 def _pcm_to_wav_bytes(audio: bytes, sample_rate: int) -> bytes:
-    """Wrap Exotel PCM16 in a WAV container for Bhashini inference."""
+    """Wrap Exotel PCM16 in a WAV container for Sarvam inference."""
     stream = io.BytesIO()
     with wave.open(stream, "wb") as wav_file:
         wav_file.setnchannels(1)
@@ -215,19 +250,34 @@ class _ExotelOutboundSender:
         self._websocket = websocket
         self._stream_sid = stream_sid
         self._lock = asyncio.Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        self._closed = True
 
     async def send_pcm(self, audio: bytes, sample_rate: int) -> None:
         """Send Exotel's minimal documented bidirectional media envelope."""
+        if self._closed:
+            return
         async with self._lock:
-            await self._websocket.send_json(
-                {
-                    "event": "media",
-                    "stream_sid": self._stream_sid,
-                    "media": {
-                        "payload": base64.b64encode(audio).decode("ascii"),
-                    },
-                }
-            )
+            if self._closed:
+                return
+            try:
+                if getattr(self._websocket, "client_state", None) != WebSocketState.CONNECTED:
+                    self._closed = True
+                    return
+                await self._websocket.send_json(
+                    {
+                        "event": "media",
+                        "stream_sid": self._stream_sid,
+                        "media": {
+                            "payload": base64.b64encode(audio).decode("ascii"),
+                        },
+                    }
+                )
+            except (RuntimeError, WebSocketDisconnect, Exception) as exc:
+                self._closed = True
+                logger.debug("outbound_send_skipped error=%s", exc)
 
 
 def _exotel_frame_size(sample_rate: int) -> int:
@@ -266,25 +316,39 @@ async def _stream_processing_keepalive(
     sample_rate: int,
     stop_event: asyncio.Event,
     call_sid: str | None,
+    language_code: str = "te-IN",
     *,
     first_frame_already_sent: bool = False,
 ) -> None:
-    """Keep the Voicebot stream active while STT/RAG/TTS waits on APIs."""
+    """Keep the Voicebot stream active and responsive while STT/RAG/TTS processes.
+
+    Streams an immediate warm acknowledgement phrase in the caller's language
+    so the user hears an immediate voice response within 500ms rather than dead silence.
+    """
     frame_size = _exotel_frame_size(sample_rate)
     silence_frame = b"\x00" * frame_size
-    # Keepalive packets are intentionally less frequent than playback packets:
-    # Exotel receives activity every 200 ms while API work is running.
-    interval_seconds = 0.2
+    filler_pcm = _get_filler_pcm(language_code)
     sent = 0
-    _turn_telemetry("[KEEPALIVE] Streaming silent audio while the answer is prepared.", call_sid=call_sid)
+    _turn_telemetry(
+        f"[KEEPALIVE] Streaming immediate acknowledgment ({language_code}) while answer is prepared.",
+        call_sid=call_sid,
+    )
     try:
-        # The caller sends the first frame synchronously before STT starts.  Do
-        # not queue a duplicate 400 ms of silence at the beginning of a turn.
-        if first_frame_already_sent:
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
-            except TimeoutError:
-                pass
+        # First, stream the filler audio frames if available (real-time voice playback)
+        if filler_pcm:
+            offset = 0
+            while offset < len(filler_pcm) and not stop_event.is_set():
+                chunk = filler_pcm[offset : offset + frame_size].ljust(frame_size, b"\x00")
+                await sender.send_pcm(chunk, sample_rate)
+                offset += frame_size
+                sent += 1
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=0.095)
+                except TimeoutError:
+                    pass
+
+        # If the answer is still being prepared after the filler, send silence keepalives
+        interval_seconds = 0.2
         while not stop_event.is_set():
             await sender.send_pcm(silence_frame, sample_rate)
             sent += 1
@@ -297,7 +361,7 @@ async def _stream_processing_keepalive(
     except Exception as exc:
         _stage_error("KEEPALIVE", exc, call_sid=call_sid)
     finally:
-        _turn_telemetry(f"[KEEPALIVE] Stopped after {sent} silent frame(s).", call_sid=call_sid)
+        _turn_telemetry(f"[KEEPALIVE] Stopped after {sent} frame(s).", call_sid=call_sid)
 
 
 async def _stream_idle_keepalive(
@@ -392,6 +456,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
     speech_active = False
     last_speech_time: float | None = None
     is_bot_turn = False
+    active_caller_language: str = settings.default_caller_language or "en-IN"
     utterance_task: asyncio.Task[None] | None = None
     outbound_sender: _ExotelOutboundSender | None = None
     idle_keepalive_stop = asyncio.Event()
@@ -411,12 +476,15 @@ async def exotel_stream(websocket: WebSocket) -> None:
         nonlocal idle_keepalive_task
         if not outbound_sender or not stream_sid:
             return
+        if getattr(websocket, "client_state", None) != WebSocketState.CONNECTED:
+            return
         if idle_keepalive_task and not idle_keepalive_task.done():
             return
         idle_keepalive_stop.clear()
-        # Send one frame synchronously so Exotel sees outbound media before any
-        # scheduler delay or Bhashini HTTP call.
-        await outbound_sender.send_pcm(b"\x00" * _exotel_frame_size(sample_rate), sample_rate)
+        try:
+            await outbound_sender.send_pcm(b"\x00" * _exotel_frame_size(sample_rate), sample_rate)
+        except Exception:
+            return
         idle_keepalive_task = asyncio.create_task(
             _stream_idle_keepalive(outbound_sender, sample_rate, idle_keepalive_stop, call_sid),
             name="exotel-idle-keepalive",
@@ -424,7 +492,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
 
     async def process_utterance(captured_audio: bytes) -> None:
         """Run one recoverable STT -> RAG -> TTS turn without idling Exotel."""
-        nonlocal speech_active, last_speech_time, is_bot_turn, utterance_task
+        nonlocal speech_active, last_speech_time, is_bot_turn, utterance_task, active_caller_language
         turn_started = time.perf_counter()
         playback_sample_rate = settings.exotel_playback_sample_rate or sample_rate
         keepalive_stop = asyncio.Event()
@@ -446,16 +514,16 @@ async def exotel_stream(websocket: WebSocket) -> None:
                 # technical vocabulary in the live phone response.
                 fallback_text = _fallback_response(language_code)
                 _turn_telemetry(
-                    "[TTS START] Synthesizing the recovery response via Bhashini...",
+                    "[TTS START] Synthesizing the recovery response via Sarvam...",
                     call_sid=call_sid,
                 )
                 fallback_started = time.perf_counter()
-                fallback_wav = await synthesize_speech(
+                fallback_wav = await synthesize_speech_sarvam(
                     fallback_text,
-                    playback_sample_rate,
-                    language_code,
+                    target_language_code=language_code,
+                    speech_sample_rate=playback_sample_rate if playback_sample_rate > 0 else 8000,
                 )
-                fallback_pcm = tts_audio_to_pcm16(
+                fallback_pcm = sarvam_audio_to_pcm16(
                     fallback_wav, playback_sample_rate
                 )
                 _turn_telemetry(
@@ -519,6 +587,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     playback_sample_rate,
                     keepalive_stop,
                     call_sid,
+                    language_code=active_caller_language,
                     first_frame_already_sent=True,
                 ),
                 name="exotel-processing-keepalive",
@@ -528,25 +597,30 @@ async def exotel_stream(websocket: WebSocket) -> None:
             await asyncio.sleep(0)
 
             try:
-                wav_audio = _pcm_to_wav_bytes(captured_audio, sample_rate)
+                trimmed_audio = _trim_trailing_silence(captured_audio, sample_rate)
+                wav_audio = _pcm_to_wav_bytes(trimmed_audio, sample_rate)
                 _turn_telemetry(
-                    f"[STT START] Sending {len(wav_audio):,} bytes to Bhashini ALD and ASR...",
+                    f"[STT START] Sending {len(wav_audio):,} bytes (trimmed from {len(captured_audio):,}) to Sarvam STT...",
                     call_sid=call_sid,
                 )
                 stt_started = time.perf_counter()
-                recognition = await transcribe_and_translate_wav(wav_audio, call_sid=call_sid)
-                english_query = str(recognition.get("english_query") or "").strip()
-                detected_language_code = str(
-                    recognition.get("detected_language_code") or settings.default_caller_language or "te-IN"
+                recognition = await transcribe_audio_sarvam(
+                    wav_audio,
+                    language_code="unknown",
                 )
-                print(f"[LANGUAGE DETECTED]: {detected_language_code} | Query: {english_query}", flush=True)
+                user_query = str(recognition.get("transcript") or recognition.get("english_query") or "").strip()
+                detected_language_code = str(
+                    recognition.get("language_code") or recognition.get("detected_language_code") or active_caller_language or "en-IN"
+                )
+                active_caller_language = detected_language_code
+                print(f"[LANGUAGE DETECTED]: {detected_language_code} | Query: {user_query}", flush=True)
                 _turn_telemetry(
                     "[STT FINISH] Transcribed in "
                     f"{time.perf_counter() - stt_started:.2f}s | Detected: "
-                    f"'{detected_language_code}' | Query: '{english_query[:500]}'",
+                    f"'{detected_language_code}' | Query: '{user_query[:500]}'",
                     call_sid=call_sid,
                 )
-                if not english_query:
+                if not user_query:
                     _turn_telemetry(
                         "[STT] Empty/noise-only utterance. Listening again.",
                         call_sid=call_sid,
@@ -568,7 +642,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     # query_rag is asynchronous and already moves the synchronous
                     # PDF/Groq middleware into asyncio.to_thread internally.
                     english_answer = await query_rag(
-                        english_query,
+                        user_query,
                         call_sid or stream_sid or "anonymous-call",
                         detected_language_code,
                     )
@@ -598,7 +672,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
             else:
                 # This is only used when LIVE_RAG_ENABLED is deliberately off.
                 # It does not invoke mechanical full-text translation.
-                english_answer = english_query
+                english_answer = user_query
                 _turn_telemetry(
                     "[RAG SKIPPED] Direct response mode is active.",
                     call_sid=call_sid,
@@ -607,8 +681,8 @@ async def exotel_stream(websocket: WebSocket) -> None:
             # RAG/Groq owns both brevity and sentence completion. Do not slice
             # generated text in Python: that can cut a spoken answer mid-sentence.
             spoken_answer = english_answer.strip()
-            if len(spoken_answer) > 500:
-                raise ValueError("Voice response exceeded Bhashini's telephony text limit")
+            if len(spoken_answer) > 1000:
+                spoken_answer = spoken_answer[:1000]
 
             try:
                 _turn_telemetry(
@@ -616,15 +690,17 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     call_sid=call_sid,
                 )
                 _turn_telemetry(
-                    "[TTS START] Synthesizing speech via Bhashini...", call_sid=call_sid
+                    "[TTS START] Synthesizing speech via Sarvam...", call_sid=call_sid
                 )
                 tts_started = time.perf_counter()
-                tts_wav = await synthesize_speech(
-                    spoken_answer, playback_sample_rate, detected_language_code
+                tts_wav = await synthesize_speech_sarvam(
+                    spoken_answer,
+                    target_language_code=detected_language_code,
+                    speech_sample_rate=playback_sample_rate if playback_sample_rate > 0 else 8000,
                 )
-                response_pcm = tts_audio_to_pcm16(tts_wav, playback_sample_rate)
+                response_pcm = sarvam_audio_to_pcm16(tts_wav, playback_sample_rate)
                 if not response_pcm:
-                    raise ValueError("Bhashini TTS returned no playable PCM audio")
+                    raise ValueError("Sarvam TTS returned no playable PCM audio")
                 _turn_telemetry(
                     "[TTS FINISH] Generated "
                     f"{playback_sample_rate // 1000}kHz PCM audio in "
@@ -767,7 +843,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
                                 )
                                 utterance_task = asyncio.create_task(
                                     process_utterance(captured_audio),
-                                    name="bhashini-exotel-loopback",
+                                    name="sarvam-exotel-loopback",
                                 )
                                 logger.info(
                                     "loopback_utterance_detected",
