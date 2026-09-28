@@ -306,9 +306,6 @@ def sarvam_audio_to_pcm16(wav_bytes: bytes, target_sample_rate: int = 8000) -> b
                     if channels == 2:
                         floats = (floats[0::2] + floats[1::2]) * 0.5
                 elif fmt_tag == 1 and bits_per_sample == 16:
-                    if channels == 1 and (source_rate == target_sample_rate or target_sample_rate <= 0):
-                        # Pristine direct 16-bit linear PCM: avoids re-quantization and clipping
-                        return raw_data
                     ints = np.frombuffer(raw_data, dtype=np.int16)
                     if channels == 2:
                         ints_mono = (ints[0::2].astype(np.float32) + ints[1::2].astype(np.float32)) * 0.5
@@ -317,12 +314,12 @@ def sarvam_audio_to_pcm16(wav_bytes: bytes, target_sample_rate: int = 8000) -> b
                         floats = ints.astype(np.float32) / 32768.0
 
                 if floats is not None and len(floats) > 0:
-                    # Remove DC bias to prevent pops and asymmetric distortion on phone speakers
+                    # Remove DC bias to prevent pops, clicks, and asymmetric distortion on phone lines
                     floats = floats - np.mean(floats)
                     # Resample if needed
                     if source_rate != target_sample_rate and target_sample_rate > 0:
                         floats = _resample_audio_polyphase(floats, source_rate, target_sample_rate)
-                    # Safe peak normalization without over-amplification
+                    # Safe peak headroom normalization without over-amplification
                     peak = float(np.max(np.abs(floats))) if len(floats) else 0.0
                     if peak > 0.95:
                         floats = floats * (0.90 / peak)
@@ -333,22 +330,30 @@ def sarvam_audio_to_pcm16(wav_bytes: bytes, target_sample_rate: int = 8000) -> b
 
     # Standard library wave reader fallback
     try:
-        with wave.open(io.BytesIO(wav_bytes), "rb") as source:
-            channels = source.getnchannels()
-            sample_width = source.getsampwidth()
-            source_rate = source.getframerate()
-            frames = source.readframes(source.getnframes())
-            if sample_width == 2 and channels == 1 and (source_rate == target_sample_rate or target_sample_rate <= 0):
-                return frames
-            if sample_width == 2 and channels == 2:
-                # Downmix stereo to mono
-                ints = np.frombuffer(frames, dtype=np.int16)
-                mono = ((ints[0::2].astype(np.int32) + ints[1::2].astype(np.int32)) // 2).astype(np.int16)
-                return mono.tobytes()
+        if len(wav_bytes) >= 12 and wav_bytes[:4] == b"RIFF" and wav_bytes[8:12] == b"WAVE":
+            with wave.open(io.BytesIO(wav_bytes), "rb") as source:
+                channels = source.getnchannels()
+                sample_width = source.getsampwidth()
+                source_rate = source.getframerate()
+                frames = source.readframes(source.getnframes())
+                if sample_width == 2:
+                    ints = np.frombuffer(frames, dtype=np.int16)
+                    if channels == 2:
+                        floats = (ints[0::2].astype(np.float32) + ints[1::2].astype(np.float32)) * 0.5 / 32768.0
+                    else:
+                        floats = ints.astype(np.float32) / 32768.0
+                    floats = floats - np.mean(floats)
+                    if source_rate != target_sample_rate and target_sample_rate > 0:
+                        floats = _resample_audio_polyphase(floats, source_rate, target_sample_rate)
+                    peak = float(np.max(np.abs(floats))) if len(floats) else 0.0
+                    if peak > 0.95:
+                        floats = floats * (0.90 / peak)
+                    return np.clip(floats * 32767.0, -32768, 32767).astype(np.int16).tobytes()
     except Exception as exc:
         logger.warning("sarvam_wave_reader_failed error=%s", exc)
 
-    return wav_bytes
+    usable_len = len(wav_bytes) - (len(wav_bytes) % 2)
+    return wav_bytes[:usable_len]
 
 
 async def transcribe_audio_file_sarvam(audio_path: str) -> dict[str, Any]:

@@ -1,0 +1,83 @@
+{
+  "Andhra Pradesh": {
+    "Visakhapatnam": [
+      {
+        "center_id": "AP_VSP_ITI_001",
+        "center_name": "Government Industrial Training Institute (Old), Visakhapatnam",
+        "type": "Government ITI / NCVT Center",
+        "address": "Opposite Industrial Estate, Kancharapalem, Visakhapatnam, Andhra Pradesh - 530007",
+        "phone": "0891-2558323",
+        "email": "ru.oitivsp@gmail.com",
+        "key_sectors": ["Electronics & Hardware", "Automotive", "Construction", "Capital Goods"],
+        "popular_trades": [
+          "Electrician",
+          "Solar PV Installer (Suryamitra)",
+          "Automobile Service Assistant",
+          "Welder",
+          "Plumber"
+        ]
+      },
+      {
+        "center_id": "AP_VSP_ITI_002",
+        "center_name": "Government ITI (New / Gajuwaka), Visakhapatnam",
+        "type": "Government ITI / Skill Hub",
+        "address": "B.C. Road, Vikas Nagar, Pedagantyada, Gajuwaka, Visakhapatnam, Andhra Pradesh - 530026",
+        "phone": "+91-9959500360",
+        "email": "ru.itivsp@gmail.com",
+        "key_sectors": ["Manufacturing", "Green Jobs", "Automotive"],
+        "popular_trades": [
+          "Solar Panel Installation Technician",
+          "CNC Operator",
+          "Two/Three Wheeler Mechanic"
+        ]
+      },
+      {
+        "center_id": "AP_VSP_RSETI_001",
+        "center_name": "SBI Rural Self Employment Training Institute (RSETI)",
+        "type": "RSETI / Enterprise Training Center",
+        "address": "PMS Plaza, Pudimadaka Road, Anakapalle, Visakhapatnam District, Andhra Pradesh - 531011",
+        "phone": "08924-222725",
+        "email": "sbirsetivizag@gmail.com",
+        "key_sectors": ["Agriculture & Allied", "Handicrafts", "Apparel"],
+        "popular_trades": [
+          "Dairy Farming & Vermicompost",
+          "Self Employed Tailor",
+          "Mushroom Grower",
+          "Micro-Enterprise Food Processing"
+        ]
+      }
+    ],
+    "Ananthapuramu": [
+      {
+        "center_id": "AP_ATP_ITI_001",
+        "center_name": "Government ITI for Boys, Ananthapuramu",
+        "type": "Government ITI / NCVT Center",
+        "address": "#7-236, Court Road, Rahamath Nagar, Adimurthy Nagar, Ananthapuramu, Andhra Pradesh - 515001",
+        "phone": "08554-220443",
+        "email": "principal.iti.atp@gmail.com",
+        "key_sectors": ["Agriculture Machinery", "Renewable Energy", "Construction"],
+        "popular_trades": [
+          "Solar Pump Technician",
+          "Tractor Service Mechanic",
+          "Assistant Electrician",
+          "Micro-Irrigation Technician"
+        ]
+      },
+      {
+        "center_id": "AP_ATP_RSETI_001",
+        "center_name": "RUDSET Institute (Canara Bank / Syndicate)",
+        "type": "Rural Self Employment Training Institute",
+        "address": "Beside S.K. University Stadium, Itukulapalli, S.V. Puram Post, Ananthapuramu, Andhra Pradesh - 515003",
+        "phone": "08554-255925",
+        "email": "rudsetiananthapuramu@gmail.com",
+        "key_sectors": ["Agri-Allied", "Handicrafts & Carpets", "Services"],
+        "popular_trades": [
+          "Goat & Sheep Farming",
+          "Leather Toy Maker",
+          "Two Shaft Handloom Weaver",
+          "Commercial Vehicle Driver"
+        ]
+      }
+    ]
+  }
+}

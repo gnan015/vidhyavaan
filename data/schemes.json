@@ -1,0 +1,83 @@
+{
+  "pm_ajay": {
+    "full_name": "PM-AJAY (Pradhan Mantri Anusuchit Jaati Abhyuday Yojana)",
+    "ministry": "Ministry of Social Justice and Empowerment (MoSJE)",
+    "target_beneficiaries": "Scheduled Caste (SC) families below poverty line",
+    "income_eligibility_ceiling_inr_pa": 250000,
+    "description": "PM-AJAY consolidates three legacy SC welfare schemes (SPADP, PMSSI, PMKVY-SC) into a single umbrella for skill development, asset subsidy, and credit linkage for SC beneficiaries.",
+    "components": {
+      "skill_training_gia": {
+        "name": "Skill Training via GIA (Grant-in-Aid)",
+        "funding": "100% Government Funded (zero cost to beneficiary)",
+        "includes": ["Free training at approved skill centers", "Travel stipend", "Free toolkits on graduation", "Placement assistance"],
+        "duration_range": "3 months to 12 months depending on trade",
+        "certification": "NSQF Level 2 to Level 4 certificates recognized by NCVET"
+      },
+      "asset_subsidy": {
+        "name": "Asset/Tool Subsidy for Self-Employment",
+        "max_subsidy_inr": 50000,
+        "max_subsidy_percent": 50,
+        "description": "Up to ₹50,000 or 50% of asset cost (whichever is less) for purchasing productive assets like sewing machines, e-rickshaws, dairy equipment, or agri-tools.",
+        "eligible_assets": ["Sewing machine", "E-rickshaw (WOW scheme)", "Dairy equipment", "Poultry shed material", "Mushroom spawn kits", "Agri-tools", "Micro-manufacturing machinery"]
+      },
+      "credit_linkages": {
+        "nsfdc_micro_finance": {
+          "name": "NSFDC Micro Finance Scheme",
+          "max_loan_inr": 140000,
+          "interest_rate_percent": 6.5,
+          "repayment_period_years": 3,
+          "for": "Small income-generating activities and working capital"
+        },
+        "nsfdc_udyam_nidhi": {
+          "name": "NSFDC Udyam Nidhi Scheme",
+          "max_loan_inr": 500000,
+          "interest_rate_percent": 8.0,
+          "repayment_period_years": 5,
+          "for": "Entrepreneurship and micro-enterprise setup"
+        },
+        "mudra_shishu": {
+          "name": "MUDRA Shishu Loan",
+          "max_loan_inr": 50000,
+          "interest_rate_percent": "varies by bank",
+          "for": "Very small business startups"
+        },
+        "mudra_kishore": {
+          "name": "MUDRA Kishore Loan",
+          "max_loan_inr": 500000,
+          "interest_rate_percent": "varies by bank",
+          "for": "Established micro-business expansion"
+        }
+      }
+    },
+    "priority_livelihood_models": {
+      "SEED": {
+        "full_name": "Self-Employment and Enterprise Development",
+        "trades": ["Mushroom Cultivation", "Poultry Farming", "Piggery", "Pisciculture (Fish Farming)", "Goat Farming", "Dairy"],
+        "income_range_inr_pm": "₹8,000 to ₹25,000 per month",
+        "for": "Rural SC families with land access"
+      },
+      "WOW": {
+        "full_name": "Women on Wheels",
+        "description": "SC women drive e-rickshaws funded by asset subsidy and NSFDC loan. Earn as delivery partner or passenger transport.",
+        "asset_cost_approx_inr": 120000,
+        "subsidy_covered_inr": 50000,
+        "income_range_inr_pm": "₹12,000 to ₹18,000 per month"
+      },
+      "rural_logistics": {
+        "name": "Rural Logistics and Agri-Supply Chain",
+        "sub_models": ["Warehousing Operator", "Cold Chain Assistant", "Agri-Transport Driver"],
+        "income_range_inr_pm": "₹10,000 to ₹20,000 per month"
+      },
+      "micro_manufacturing": {
+        "name": "Micro-Manufacturing",
+        "trades": ["Incense Stick Making", "Candle Making", "Bamboo Craft", "Leather Goods", "Handloom Weaving"],
+        "income_range_inr_pm": "₹7,000 to ₹15,000 per month"
+      }
+    },
+    "application_process": {
+      "offline": "Visit nearest DRDA/Block Development Office or SC Welfare District Office with Aadhaar, caste certificate, income certificate",
+      "online": "Apply at https://socialjustice.gov.in or via CSC (Common Service Centre) in your village",
+      "documents_required": ["Aadhaar Card", "Caste Certificate (SC)", "Income Certificate (family income below ₹2,50,000)", "Bank account passbook", "Passport-size photograph"]
+    }
+  }
+}

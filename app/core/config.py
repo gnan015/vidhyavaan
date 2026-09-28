@@ -38,8 +38,8 @@ class Settings(BaseSettings):
     default_caller_language: str = "en-IN"
     server_base_url: str | None = None
     vad_rms_threshold: int = 400
-    # Trigger the voice turn promptly (550ms) after the caller finishes speaking.
-    vad_silence_seconds: float = 0.55
+    # Fast silence timeout threshold (~600ms - 800ms) for instant turn completion.
+    vad_silence_seconds: float = 0.7
     rag_query_timeout_seconds: float = 6.0
     # Use the attached knowledge base and LLM to answer the caller's question.
     live_rag_enabled: bool = True

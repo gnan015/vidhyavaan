@@ -7,3 +7,4 @@ groq>=0.30,<1.0
 pypdf>=5.0,<6.0
 python-dotenv>=1.0,<2.0
 websockets>=12.0,<16.0
+openpyxl>=3.0,<4.0

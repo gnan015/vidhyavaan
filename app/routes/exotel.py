@@ -36,13 +36,165 @@ logger = logging.getLogger(__name__)
 XML_MEDIA_TYPE = "application/xml"
 STREAM_RECORDINGS_DIRECTORY = Path("recordings")
 _transcription_tasks: set[asyncio.Task[dict[str, Any]]] = set()
+
+# PM-AJAY fallback messages per language
 _FALLBACK_RESPONSES = {
-    "en-IN": "Sorry, I could not find information on that.",
-    "hi-IN": "माफ़ कीजिए, मुझे इस बारे में जानकारी नहीं मिली।",
-    "te-IN": "క్షమించండి, దీని గురించి నాకు సమాచారం దొరకలేదు.",
-    "ta-IN": "மன்னிக்கவும், இதைப் பற்றிய தகவல் கிடைக்கவில்லை.",
-    "kn-IN": "ಕ್ಷಮಿಸಿ, ಇದರ ಬಗ್ಗೆ ಮಾಹಿತಿ ಸಿಗಲಿಲ್ಲ.",
+    "en-IN": "Sorry, I could not fetch the answer. Please ask again or call our helpline 1800-11-2001.",
+    "hi-IN": "माफ़ कीजिए, अभी जानकारी नहीं मिली। कृपया फिर पूछें या helpline 1800-11-2001 पर call करें।",
+    "te-IN": "క్షమించండి, ప్రస్తుతం సమాధానం దొరకలేదు. మళ్ళీ అడగండి లేదా helpline 1800-11-2001 కి call చేయండి.",
+    "ta-IN": "மன்னிக்கவும், தகவல் கிடைக்கவில்லை. மீண்டும் கேளுங்கள் அல்லது helpline 1800-11-2001 call பண்ணுங்கள்.",
+    "kn-IN": "ಕ್ಷಮಿಸಿ, ಮಾಹಿತಿ ಸಿಗಲಿಲ್ಲ. ಮತ್ತೆ ಕೇಳಿ ಅಥವಾ helpline 1800-11-2001 ಗೆ call ಮಾಡಿ.",
 }
+
+# ─── PM-AJAY Session State Machine ─────────────────────────────────────────────
+# Each call goes through a structured 4-turn intake before free-form Q&A.
+# turn 0: greeting + ask education level
+# turn 1: ask family trade / current occupation
+# turn 2: ask district
+# turn 3: ask preference (wage vs self-employment)
+# turn 4+: free-form PM-AJAY scheme Q&A using ChromaDB RAG
+_CALL_SESSIONS: dict[str, dict] = {}
+
+def _normalize_lang_code(code: str | None) -> str:
+    if not code:
+        return "en-IN"
+    c = code.strip().lower()
+    if c.startswith("te"):
+        return "te-IN"
+    if c.startswith("hi"):
+        return "hi-IN"
+    if c.startswith("ta"):
+        return "ta-IN"
+    if c.startswith("kn"):
+        return "kn-IN"
+    if c.startswith("bn"):
+        return "bn-IN"
+    return "en-IN"
+
+
+def detect_transcript_language(text: str, asr_hint: str | None = None) -> str:
+    """
+    Dynamically detect the caller's spoken language from their transcript text and ASR hint.
+    Returns standard language code: 'en-IN', 'te-IN', 'hi-IN', 'ta-IN', 'kn-IN', or 'bn-IN'.
+    """
+    clean_text = text.strip()
+    if not clean_text:
+        return _normalize_lang_code(asr_hint or "en-IN")
+
+    # 1. Unambiguous native Unicode scripts
+    if re.search(r"[\u0C00-\u0C7F]", clean_text):  # Telugu
+        return "te-IN"
+    if re.search(r"[\u0900-\u097F]", clean_text):  # Devanagari / Hindi
+        return "hi-IN"
+    if re.search(r"[\u0B80-\u0BFF]", clean_text):  # Tamil
+        return "ta-IN"
+    if re.search(r"[\u0C80-\u0CFF]", clean_text):  # Kannada
+        return "kn-IN"
+    if re.search(r"[\u0980-\u09FF]", clean_text):  # Bengali
+        return "bn-IN"
+
+    # 2. Romanized Indic keywords (when transliterated to Latin script)
+    te_roman = re.compile(r"\b(ante|enti|ela|mariyu|unna|chese|cheppandi|cheyadam|kadha|gurinchi|enduku|chesukondi|kaavali|undi|telusukovalani|unnanu|uudyogam|chaduvukunna)\b", re.IGNORECASE)
+    hi_roman = re.compile(r"\b(kya|kaise|hota|hoti|bataiye|batao|karte|karna|chahiye|mujhe|mera|meri|seekhna|chahata|chahati|padhai|karega)\b", re.IGNORECASE)
+    ta_roman = re.compile(r"\b(enna|epdi|adha|pannuvanga|solunga|kaaga|irukku|panlaam|venum)\b", re.IGNORECASE)
+    kn_roman = re.compile(r"\b(yenu|hege|beku|madabeku|thilisiri|nanna)\b", re.IGNORECASE)
+
+    if te_roman.search(clean_text):
+        return "te-IN"
+    if hi_roman.search(clean_text):
+        return "hi-IN"
+    if ta_roman.search(clean_text):
+        return "ta-IN"
+    if kn_roman.search(clean_text):
+        return "kn-IN"
+
+    # 3. English lexical presence
+    en_words = re.compile(
+        r"\b(i|my|me|we|you|your|want|need|have|completed|pass|class|job|course|courses|training|salary|district|live|school|computer|computers|work|trade|experience|recommend|tell|about|what|which|where|how|can|is|are|in|at|to|for|with|and|the|wage|self|business|employment|help|hello|yes|no)\b",
+        re.IGNORECASE,
+    )
+    en_matches = len(en_words.findall(clean_text))
+    if en_matches >= 2:
+        return "en-IN"
+
+    # 4. If ASR provided a specific valid language hint
+    if asr_hint and asr_hint.lower() not in ("unknown", "", "none"):
+        return _normalize_lang_code(asr_hint)
+
+    return "en-IN"
+
+
+def _get_session(call_sid: str) -> dict:
+    if call_sid not in _CALL_SESSIONS:
+        _CALL_SESSIONS[call_sid] = {
+            "turn": 0,
+            "language": "en-IN",
+            "caller_number": "",
+            "profile": {
+                "education": None,
+                "family_trade": None,
+                "district": None,
+                "preference": None,
+                "physical_constraint": None,
+            },
+        }
+    return _CALL_SESSIONS[call_sid]
+
+
+def _intake_question(turn: int, language: str) -> str:
+    """Return the structured intake question for each turn in the caller's language."""
+    questions: dict[int, dict[str, str]] = {
+        0: {
+            "en-IN": "Welcome to Kaushal Vaani - Virtual Livelihood Assistant. May I know your name and your highest education: primary school, 8th to 10th pass, or 12th pass?",
+            "te-IN": "కౌశల్ వాణి (Kaushal Vaani) కి స్వాగతం. మీ పేరు మరియు మీ విద్యార్హత ఏమిటి — primary school, 8th to 10th pass, లేదా 12th pass?",
+            "hi-IN": "कौशल वाणी (Kaushal Vaani) में आपका स्वागत है। आपका नाम और आपकी पढ़ाई कितनी है — primary school, 8th to 10th pass, या 12th pass?",
+            "ta-IN": "கௌசல் வாணி (Kaushal Vaani)-க்கு வரவேற்கிறோம். உங்கள் பெயர் மற்றும் கல்வித் தகுதி என்ன — primary school, 8th to 10th pass, அல்லது 12th pass?",
+            "kn-IN": "ಕೌಶಲ್ ವಾಣಿ (Kaushal Vaani) ಗೆ ಸ್ವಾಗತ. ನಿಮ್ಮ ಹೆಸರು ಮತ್ತು ವಿದ್ಯಾಭ್ಯಾಸ ಎಷ್ಟು — primary school, 8th to 10th pass, ಅಥವಾ 12th pass?",
+        },
+        1: {
+            "en-IN": "Thank you. What work does your family currently do, or what is your trade experience, like farming, tailoring, construction, or artisan crafts?",
+            "te-IN": "ధన్యవాదాలు. మీ కుటుంబ వృత్తి లేదా పని అనుభవం ఏమిటి — వ్యవసాయం (farming), tailoring, construction, లేదా artisan crafts?",
+            "hi-IN": "धन्यवाद। आपका परिवार अभी क्या काम करता है, या आपका अनुभव क्या है — farming, tailoring, construction, या artisan crafts?",
+            "ta-IN": "நன்றி. உங்கள் குடும்பத் தொழில் அல்லது பணி அனுபவம் என்ன — farming, tailoring, construction, அல்லது artisan crafts?",
+            "kn-IN": "ಧನ್ಯವಾದ. ನಿಮ್ಮ ಕುಟುಂಬ ಈಗ ಏನು ಕೆಲಸ ಮಾಡುತ್ತಿದೆ, ಅಥವಾ ಕಸುಬು ಏನು — farming, tailoring, construction, ಅಥವಾ artisan crafts?",
+        },
+        2: {
+            "en-IN": "Understood. Which district do you live in, and do you prefer a regular wage job or self-employment to start your own business?",
+            "te-IN": "అర్థమైంది. మీరు ఏ district లో నివసిస్తున్నారు, మరియు మీకు regular ఉద్యోగం (wage job) కావాలా లేదా స్వయం ఉపాధి (self-employment) కావాలా?",
+            "hi-IN": "समझ गया। आप किस district में रहते हैं, और क्या आप regular नौकरी चाहते हैं या अपना business (self-employment) शुरू करना चाहते हैं?",
+            "ta-IN": "புரிந்தது. நீங்கள் எந்த district-ல் வசிக்கிறீர்கள், மற்றும் regular வேலை விரும்புகிறீர்களா அல்லது சுயதொழில் (self-employment) செய்ய விரும்புகிறீர்களா?",
+            "kn-IN": "ತಿಳಿಯಿತು. ನೀವು ಯಾವ district-ನಲ್ಲಿ ವಾಸಿಸುತ್ತೀರಿ, ಮತ್ತು regular ಉದ್ಯೋಗ ಬೇಕೇ ಅಥವಾ ಸ್ವಂತ ಉದ್ಯಮ (self-employment) ಬೇಕೇ?",
+        },
+        3: {
+            "en-IN": "Do you prefer regular wage employment, or starting your own small business or self-employment?",
+            "te-IN": "మీకు regular job కావాలా, లేదా మీ సొంత business లేదా self-employment కావాలా?",
+            "hi-IN": "क्या आप regular नौकरी चाहते हैं, या अपना खुद का छोटा business या self-employment?",
+            "ta-IN": "நீங்கள் regular job விரும்புகிறீர்களா, அல்லது சொந்தமாக small business அல்லது self-employment?",
+            "kn-IN": "ನಿಮಗೆ regular job ಬೇಕೇ, ಅಥವಾ ನಿಮ್ಮದೇ small business ಅಥವಾ self-employment ಬೇಕೇ?",
+        },
+    }
+    lang_q = questions.get(turn, {})
+    return lang_q.get(language, lang_q.get("en-IN", ""))
+
+
+def _build_recommendation_query(profile: dict, language: str) -> str:
+    """Build a PM-AJAY RAG query from the collected intake profile."""
+    edu = profile.get("education") or "not specified"
+    trade = profile.get("family_trade") or "not specified"
+    district = profile.get("district") or "not specified"
+    pref = profile.get("preference") or "not specified"
+    constraint = profile.get("physical_constraint")
+
+    query = (
+        f"I am a Scheduled Caste beneficiary with education level {edu}, "
+        f"my family's current work is {trade}, I live in {district} district, "
+        f"and I prefer {pref}. "
+        "What PM-AJAY scheme benefits, skill training trades, asset subsidy, and credit linkages "
+        "are best suited for me? Suggest the most appropriate livelihood model."
+    )
+    if constraint:
+        query += f" Note: I have a physical disability."
+    return query
 
 
 def exotel_hangup_xml() -> str:
@@ -60,22 +212,85 @@ def _fallback_response(language_code: str) -> str:
     return get_language_profile(language_code)["fallback"]
 
 
-FILLERS_DIRECTORY = Path(__file__).resolve().parents[1] / "assets" / "fillers"
-_CACHED_FILLERS: dict[str, bytes] = {}
+CENTERS_DATA_PATH = Path(__file__).resolve().parents[2] / "data" / "centers.json"
+_CACHED_CENTERS: dict | None = None
 
 
-def _get_filler_pcm(language_code: str = "en-IN") -> bytes:
-    """Return pre-synthesized conversational acknowledgment PCM audio."""
-    norm = language_code.strip()
-    if norm not in _CACHED_FILLERS:
-        filler_path = FILLERS_DIRECTORY / f"{norm}.pcm"
-        if not filler_path.is_file():
-            filler_path = FILLERS_DIRECTORY / "en-IN.pcm"
-        if filler_path.is_file():
-            _CACHED_FILLERS[norm] = filler_path.read_bytes()
+def _resolve_nearest_center(district_query: str | None, preference: str | None = None) -> dict | None:
+    """Resolve the nearest training center from centers.json by district and preference."""
+    global _CACHED_CENTERS
+    if _CACHED_CENTERS is None:
+        if CENTERS_DATA_PATH.is_file():
+            try:
+                _CACHED_CENTERS = json.loads(CENTERS_DATA_PATH.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning("centers_json_load_failed error=%s", exc)
+                _CACHED_CENTERS = {}
         else:
-            _CACHED_FILLERS[norm] = b""
-    return _CACHED_FILLERS.get(norm, b"")
+            _CACHED_CENTERS = {}
+
+    all_centers: list[dict] = []
+    matched: list[dict] = []
+    norm = (district_query or "").lower().strip()
+
+    for state, dists in _CACHED_CENTERS.items():
+        if isinstance(dists, dict):
+            for dist, c_list in dists.items():
+                if isinstance(c_list, list):
+                    for c in c_list:
+                        c_info = dict(c, state=state, district=dist)
+                        all_centers.append(c_info)
+                        if dist.lower() in norm or any(w in dist.lower() for w in norm.split() if len(w) > 3):
+                            matched.append(c_info)
+
+    candidates = matched or all_centers
+    is_self = "self" in (preference or "").lower() or "business" in (preference or "").lower()
+    for c in candidates:
+        c_type = c.get("type", "").lower()
+        if is_self and ("rseti" in c_type or "rudset" in c_type):
+            return c
+        elif not is_self and "iti" in c_type:
+            return c
+    return candidates[0] if candidates else None
+
+
+async def send_sms_followup(caller_number: str, message: str) -> bool:
+    """Send automated follow-up SMS via Exotel SMS API or log for dispatch."""
+    import os
+    import httpx
+    clean_number = re.sub(r"[^0-9+]", "", caller_number or "")
+    if not clean_number or len(clean_number) < 10:
+        logger.info("[SMS FOLLOWUP] Skipped: Invalid or missing phone number '%s'.", caller_number)
+        return False
+
+    settings = get_settings()
+    username = getattr(settings, "exotel_username", None) or os.getenv("EXOTEL_USERNAME", "")
+    password = getattr(settings, "exotel_password", None) or os.getenv("EXOTEL_PASSWORD", "")
+    account_sid = getattr(settings, "exotel_account_sid", None) or os.getenv("EXOTEL_ACCOUNT_SID", "") or username
+    subdomain = getattr(settings, "exotel_subdomain", None) or os.getenv("EXOTEL_SUBDOMAIN", "api.exotel.com")
+
+    logger.info("[SMS FOLLOWUP] Dispatching to %s: %s", clean_number, message[:80])
+    print(f"[SMS FOLLOWUP] Dispatching to {clean_number}: {message}", flush=True)
+
+    if username and password and account_sid:
+        url = f"https://{subdomain}/v1/Accounts/{account_sid}/Sms/send.json"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    url,
+                    auth=(username, password),
+                    data={
+                        "From": getattr(settings, "exotel_caller_id", None) or os.getenv("EXOTEL_CALLER_ID", "08088919888"),
+                        "To": clean_number,
+                        "Body": message,
+                    },
+                )
+                logger.info("[SMS FOLLOWUP] Exotel SMS response code=%d", resp.status_code)
+                return resp.status_code in (200, 201)
+        except Exception as exc:
+            logger.warning("[SMS FOLLOWUP] Exotel SMS dispatch failed: %s", exc)
+            return False
+    return True
 
 
 def _trim_trailing_silence(audio: bytes, sample_rate: int, keep_silence_ms: int = 120) -> bytes:
@@ -279,10 +494,12 @@ class _ExotelOutboundSender:
                 self._closed = True
                 logger.debug("outbound_send_skipped error=%s", exc)
 
+DEFAULT_TELEPHONY_FRAME_MS = 20  # Strict 20ms frames for Exotel telephony streaming
 
-def _exotel_frame_size(sample_rate: int) -> int:
-    """Return one 100 ms frame of mono 16-bit PCM for Exotel playback."""
-    return sample_rate * 2 // 10
+
+def _exotel_frame_size(sample_rate: int, duration_ms: int = DEFAULT_TELEPHONY_FRAME_MS) -> int:
+    """Return one 20ms frame of mono 16-bit PCM for Exotel playback (320 bytes @ 8kHz, 640 bytes @ 16kHz)."""
+    return int((sample_rate * 2 * duration_ms) // 1000)
 
 
 async def _stream_pcm_to_exotel(
@@ -291,23 +508,40 @@ async def _stream_pcm_to_exotel(
     audio: bytes,
     sample_rate: int,
     sender: _ExotelOutboundSender | None = None,
+    barge_in_event: asyncio.Event | None = None,
+    frame_duration_ms: int = DEFAULT_TELEPHONY_FRAME_MS,
 ) -> int:
-    """Send Exotel-compliant PCM16 frames at approximately real-time pace.
+    """Send Exotel-compliant PCM16 frames at real-time pace with barge-in support.
 
-    Each payload is 100 ms of signed 16-bit little-endian mono PCM: 1,600 bytes
-    at 8 kHz and 3,200 bytes at 16 kHz.
+    Synthesized audio is broken into strict 20ms frames (e.g., 320 bytes at 8 kHz or 640 bytes at 16 kHz)
+    and paced using drift-free monotonic clock timing to prevent buffer underruns, jitter, and stuttering.
     """
-    frame_size = _exotel_frame_size(sample_rate)
+    frame_size = _exotel_frame_size(sample_rate, frame_duration_ms)
+    frame_delay = frame_duration_ms / 1000.0
     frames_sent = 0
     sender = sender or _ExotelOutboundSender(websocket, stream_sid)
+    start_time = time.monotonic()
+
     for offset in range(0, len(audio), frame_size):
+        if barge_in_event and barge_in_event.is_set():
+            logger.info("playback_interrupted_by_barge_in", extra={"stream_sid": stream_sid})
+            break
         chunk = audio[offset : offset + frame_size]
-        # Exotel rejects a short final frame; pad it with playback silence.
+        # Pad short final frame with PCM silence (0x00) to maintain uniform frame size
         if len(chunk) < frame_size:
             chunk = chunk.ljust(frame_size, b"\x00")
         await sender.send_pcm(chunk, sample_rate)
         frames_sent += 1
-        await asyncio.sleep(0.095)
+
+        # Drift-free real-time frame pacing
+        expected_elapsed = frames_sent * frame_delay
+        actual_elapsed = time.monotonic() - start_time
+        sleep_needed = expected_elapsed - actual_elapsed
+        if sleep_needed > 0:
+            await asyncio.sleep(sleep_needed)
+        else:
+            await asyncio.sleep(0.001)
+
     return frames_sent
 
 
@@ -320,34 +554,12 @@ async def _stream_processing_keepalive(
     *,
     first_frame_already_sent: bool = False,
 ) -> None:
-    """Keep the Voicebot stream active and responsive while STT/RAG/TTS processes.
-
-    Streams an immediate warm acknowledgement phrase in the caller's language
-    so the user hears an immediate voice response within 500ms rather than dead silence.
-    """
-    frame_size = _exotel_frame_size(sample_rate)
+    """Keep the Voicebot stream active while STT/RAG/TTS processes.
+    Streams silent frames (no holding speech or filler audio) at 100ms intervals."""
+    frame_size = _exotel_frame_size(sample_rate, DEFAULT_TELEPHONY_FRAME_MS)
     silence_frame = b"\x00" * frame_size
-    filler_pcm = _get_filler_pcm(language_code)
     sent = 0
-    _turn_telemetry(
-        f"[KEEPALIVE] Streaming immediate acknowledgment ({language_code}) while answer is prepared.",
-        call_sid=call_sid,
-    )
     try:
-        # First, stream the filler audio frames if available (real-time voice playback)
-        if filler_pcm:
-            offset = 0
-            while offset < len(filler_pcm) and not stop_event.is_set():
-                chunk = filler_pcm[offset : offset + frame_size].ljust(frame_size, b"\x00")
-                await sender.send_pcm(chunk, sample_rate)
-                offset += frame_size
-                sent += 1
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=0.095)
-                except TimeoutError:
-                    pass
-
-        # If the answer is still being prepared after the filler, send silence keepalives
         interval_seconds = 0.2
         while not stop_event.is_set():
             await sender.send_pcm(silence_frame, sample_rate)
@@ -360,8 +572,6 @@ async def _stream_processing_keepalive(
         raise
     except Exception as exc:
         _stage_error("KEEPALIVE", exc, call_sid=call_sid)
-    finally:
-        _turn_telemetry(f"[KEEPALIVE] Stopped after {sent} frame(s).", call_sid=call_sid)
 
 
 async def _stream_idle_keepalive(
@@ -446,13 +656,14 @@ async def exotel_stream(websocket: WebSocket) -> None:
     sample_width = 2
     encoding = "audio/x-raw"
     audio_frames = bytearray()
-    audio_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    audio_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=100)
     media_chunk_count = 0
     frames_received = 0
     frames_processed = 0
     sequence_gaps = 0
     last_sequence: int | None = None
     last_chunk_size = 0
+    barge_in_event = asyncio.Event()
     speech_active = False
     last_speech_time: float | None = None
     is_bot_turn = False
@@ -491,12 +702,17 @@ async def exotel_stream(websocket: WebSocket) -> None:
         )
 
     async def process_utterance(captured_audio: bytes) -> None:
-        """Run one recoverable STT -> RAG -> TTS turn without idling Exotel."""
+        """Run one recoverable STT -> 4-turn intake / RAG -> TTS turn."""
         nonlocal speech_active, last_speech_time, is_bot_turn, utterance_task, active_caller_language
         turn_started = time.perf_counter()
         playback_sample_rate = settings.exotel_playback_sample_rate or sample_rate
         keepalive_stop = asyncio.Event()
         keepalive_task: asyncio.Task[None] | None = None
+
+        # Retrieve or create session for this call
+        session_id = call_sid or stream_sid or "anonymous"
+        session = _get_session(session_id)
+        session["language"] = active_caller_language
 
         async def stop_keepalive() -> None:
             keepalive_stop.set()
@@ -609,14 +825,14 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     language_code="unknown",
                 )
                 user_query = str(recognition.get("transcript") or recognition.get("english_query") or "").strip()
-                detected_language_code = str(
-                    recognition.get("language_code") or recognition.get("detected_language_code") or active_caller_language or "en-IN"
-                )
+                asr_lang = recognition.get("language_code") or recognition.get("detected_language_code")
+                detected_language_code = detect_transcript_language(user_query, asr_lang)
+                session["language"] = detected_language_code
                 active_caller_language = detected_language_code
-                print(f"[LANGUAGE DETECTED]: {detected_language_code} | Query: {user_query}", flush=True)
+                print(f"[LANGUAGE DETECTED & MIRRORED]: {detected_language_code} | Query: {user_query}", flush=True)
                 _turn_telemetry(
                     "[STT FINISH] Transcribed in "
-                    f"{time.perf_counter() - stt_started:.2f}s | Detected: "
+                    f"{time.perf_counter() - stt_started:.2f}s | Language: "
                     f"'{detected_language_code}' | Query: '{user_query[:500]}'",
                     call_sid=call_sid,
                 )
@@ -630,53 +846,132 @@ async def exotel_stream(websocket: WebSocket) -> None:
                 raise
             except Exception as exc:
                 _stage_error("STT", exc, call_sid=call_sid)
-                await play_failure_message()
+                await play_failure_message(session.get("language", active_caller_language))
                 return
 
-            if settings.live_rag_enabled:
-                try:
-                    _turn_telemetry(
-                        "[RAG START] Querying middleware knowledge base...", call_sid=call_sid
-                    )
-                    rag_started = time.perf_counter()
-                    # query_rag is asynchronous and already moves the synchronous
-                    # PDF/Groq middleware into asyncio.to_thread internally.
-                    english_answer = await query_rag(
-                        user_query,
-                        call_sid or stream_sid or "anonymous-call",
-                        detected_language_code,
-                    )
-                    if not english_answer:
-                        raise RuntimeError("RAG middleware returned no usable answer")
+            # ── 4-Turn Structured Intake State Machine ───────────────────────
+            current_turn = session.get("turn", 0)
+            profile = session.setdefault("profile", {})
+            call_lang = session.get("language", active_caller_language)
+
+            if current_turn == 0:
+                # Turn 0 reply = caller's name & education level
+                profile["education"] = user_query
+                name_match = re.search(r"(?:my name is|i am|name is|పేరు|నా పేరు|मेरा नाम|नाम)\s+([A-Za-z\u0C00-\u0C7F\u0900-\u097F]+)", user_query, re.IGNORECASE)
+                if name_match:
+                    profile["name"] = name_match.group(1).strip()
+                session["turn"] = 1
+                english_answer = _intake_question(1, call_lang)
+                _turn_telemetry(f"[INTAKE T1] education='{user_query}' name='{profile.get('name')}' lang='{call_lang}'", call_sid=call_sid)
+
+            elif current_turn == 1:
+                # Turn 1 reply = family trade / occupation experience
+                profile["family_trade"] = user_query
+                session["turn"] = 2
+                english_answer = _intake_question(2, call_lang)
+                _turn_telemetry(f"[INTAKE T2] trade='{user_query}' lang='{call_lang}'", call_sid=call_sid)
+
+            elif current_turn in (2, 3):
+                # Turn 2 reply = district & employment preference (wage vs self-employed)
+                resp_lower = user_query.lower()
+                if any(kw in resp_lower for kw in ["self", "business", "own", "swa", "apna", "swayam", "udyam", "entrepren", "mushroom", "poultry", "dairy", "tailor", "shop", "vyapar"]):
+                    profile["preference"] = "self-employment"
+                elif any(kw in resp_lower for kw in ["wage", "job", "naukri", "regular", "company", "salary"]):
+                    profile["preference"] = "wage employment"
+                elif profile.get("preference") is None:
+                    profile["preference"] = "wage employment"
+
+                if profile.get("district") is None:
+                    profile["district"] = user_query
+
+                # Advance to Turn 3 (final recommendation + automated SMS)
+                session["turn"] = 3
+                _turn_telemetry(f"[INTAKE T3] district='{profile['district']}' preference='{profile['preference']}' lang='{call_lang}'", call_sid=call_sid)
+
+                # Instantly query vector store and resolve nearest center
+                nearest_center = _resolve_nearest_center(profile.get("district"), profile.get("preference"))
+                center_name = nearest_center.get("center_name", "District Skill Training Center") if nearest_center else "District Skill Training Center"
+                center_phone = nearest_center.get("phone", "1800-11-2001") if nearest_center else "1800-11-2001"
+                center_dist = nearest_center.get("district", "your district") if nearest_center else "your district"
+
+                rag_query = _build_recommendation_query(profile, call_lang)
+                if settings.live_rag_enabled:
+                    try:
+                        _turn_telemetry("[RAG START] Personalised scheme recommendation...", call_sid=call_sid)
+                        rag_started = time.perf_counter()
+                        english_answer = await query_rag(rag_query, session_id, language=call_lang)
+                        if not english_answer:
+                            raise RuntimeError("RAG returned no answer for personalised query")
+                        _turn_telemetry(
+                            f"[RAG FINISH] {time.perf_counter() - rag_started:.2f}s | '{english_answer[:300]}'",
+                            call_sid=call_sid,
+                        )
+                    except Exception as exc:
+                        _stage_error("RAG", exc, call_sid=call_sid)
+                        english_answer = (
+                            f"Based on your profile in {center_dist}, you are eligible for free PM-AJAY skill training and asset subsidy up to Rs 50,000. "
+                            f"Your nearest center is {center_name}. You can also access NSFDC concessional loans."
+                        )
+                else:
                     english_answer = (
-                        english_answer.replace("\u2011", "-")
-                        .replace("\u2013", "-")
-                        .replace("\u2014", "-")
-                        .replace("\u2018", "'")
-                        .replace("\u2019", "'")
-                        .replace("\u201c", '"')
-                        .replace("\u201d", '"')
+                        f"Based on your profile in {center_dist}, you are eligible for free PM-AJAY skill training and asset subsidy up to Rs 50,000. "
+                        f"Your nearest center is {center_name}. You can also access NSFDC concessional loans."
                     )
-                    _turn_telemetry(
-                        "[RAG FINISH] RAG responded in "
-                        f"{time.perf_counter() - rag_started:.2f}s | Answer: "
-                        f"'{english_answer[:500]}'",
-                        call_sid=call_sid,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    _stage_error("RAG", exc, call_sid=call_sid)
-                    await play_failure_message(detected_language_code)
-                    return
-            else:
-                # This is only used when LIVE_RAG_ENABLED is deliberately off.
-                # It does not invoke mechanical full-text translation.
-                english_answer = user_query
-                _turn_telemetry(
-                    "[RAG SKIPPED] Direct response mode is active.",
-                    call_sid=call_sid,
+
+                # Trigger automated SMS follow-up
+                caller_num = session.get("caller_number") or ""
+                caller_name = profile.get("name") or "Beneficiary"
+                sms_text = (
+                    f"Kaushal Vaani (PM-AJAY) Recommendation: Dear {caller_name}, your career plan is ready. "
+                    f"Benefits: Free PM-AJAY Skill Training, Asset Subsidy up to Rs 50,000, NSFDC Loans. "
+                    f"Nearest Center: {center_name} ({center_phone}). Helpline: 1800-11-2001."
                 )
+                if caller_num:
+                    asyncio.create_task(send_sms_followup(caller_num, sms_text))
+
+                # Advance to 4 so caller can ask follow-up questions
+                session["turn"] = 4
+
+            else:
+                # Turn 4+: free-form PM-AJAY scheme Q&A
+                if settings.live_rag_enabled:
+                    try:
+                        _turn_telemetry(
+                            "[RAG START] Querying PM-AJAY knowledge base...", call_sid=call_sid
+                        )
+                        rag_started = time.perf_counter()
+                        english_answer = await query_rag(
+                            user_query,
+                            session_id,
+                            language=call_lang,
+                        )
+                        if not english_answer:
+                            raise RuntimeError("RAG middleware returned no usable answer")
+                        _turn_telemetry(
+                            f"[RAG FINISH] {time.perf_counter() - rag_started:.2f}s | '{english_answer[:300]}'",
+                            call_sid=call_sid,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        _stage_error("RAG", exc, call_sid=call_sid)
+                        await play_failure_message(call_lang)
+                        return
+                else:
+                    english_answer = user_query
+                    _turn_telemetry("[RAG SKIPPED] Direct response mode is active.", call_sid=call_sid)
+
+
+            english_answer = (
+                english_answer
+                .replace("\u2011", "-")
+                .replace("\u2013", "-")
+                .replace("\u2014", "-")
+                .replace("\u2018", "'")
+                .replace("\u2019", "'")
+                .replace("\u201c", '"')
+                .replace("\u201d", '"')
+            )
 
             # RAG/Groq owns both brevity and sentence completion. Do not slice
             # generated text in Python: that can cut a spoken answer mid-sentence.
@@ -695,7 +990,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
                 tts_started = time.perf_counter()
                 tts_wav = await synthesize_speech_sarvam(
                     spoken_answer,
-                    target_language_code=detected_language_code,
+                    target_language_code=call_lang,
                     speech_sample_rate=playback_sample_rate if playback_sample_rate > 0 else 8000,
                 )
                 response_pcm = sarvam_audio_to_pcm16(tts_wav, playback_sample_rate)
@@ -711,11 +1006,14 @@ async def exotel_stream(websocket: WebSocket) -> None:
                 raise
             except Exception as exc:
                 _stage_error("TTS", exc, call_sid=call_sid)
-                await play_failure_message(detected_language_code)
+                await play_failure_message(call_lang)
                 return
 
             try:
                 await stop_keepalive()
+                if barge_in_event and barge_in_event.is_set():
+                    _turn_telemetry("[PLAYBACK SKIPPED] Caller barged in before playback started.", call_sid=call_sid)
+                    return
                 frame_size = _exotel_frame_size(playback_sample_rate)
                 expected_frames = (len(response_pcm) + frame_size - 1) // frame_size
                 _turn_telemetry(
@@ -734,6 +1032,7 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     response_pcm,
                     playback_sample_rate,
                     outbound_sender,
+                    barge_in_event=barge_in_event,
                 )
                 _turn_telemetry(
                     "[READY] Playback complete. Listening for next turn. "
@@ -819,36 +1118,58 @@ async def exotel_stream(websocket: WebSocket) -> None:
                         "exotel_media_processed",
                         extra={"call_sid": call_sid, "event": "media", "chunk_count": frames_processed},
                     )
-                if sample_width == 2 and not is_bot_turn:
+                if sample_width == 2:
                     try:
                         now = time.monotonic()
                         energy = _pcm_rms(audio)
-                        if energy >= settings.vad_rms_threshold:
-                            speech_active = True
-                            last_speech_time = now
-                        if speech_active:
-                            audio_frames.extend(audio)
-                            if (
-                                last_speech_time is not None
-                                and now - last_speech_time >= settings.vad_silence_seconds
-                                and audio_frames
-                            ):
-                                is_bot_turn = True
-                                captured_audio = bytes(audio_frames)
-                                duration_seconds = len(captured_audio) / (sample_rate * 2)
-                                _turn_telemetry(
-                                    "[VAD] User stopped speaking (silence detected). "
-                                    f"Audio duration: {duration_seconds:.2f}s",
-                                    call_sid=call_sid,
-                                )
-                                utterance_task = asyncio.create_task(
-                                    process_utterance(captured_audio),
-                                    name="sarvam-exotel-loopback",
-                                )
-                                logger.info(
-                                    "loopback_utterance_detected",
-                                    extra={"call_sid": call_sid, "event": "loopback"},
-                                )
+                        if is_bot_turn:
+                            # Natural barge-in: If caller starts speaking while bot is talking
+                            if energy >= settings.vad_rms_threshold * 1.5:
+                                _turn_telemetry("[BARGE-IN] Caller interrupted bot playback.", call_sid=call_sid)
+                                barge_in_event.set()
+                                if utterance_task and not utterance_task.done():
+                                    utterance_task.cancel()
+                                    _turn_telemetry("[BARGE-IN] Cancelled active utterance task.", call_sid=call_sid)
+                                is_bot_turn = False
+                                speech_active = True
+                                last_speech_time = now
+                                audio_frames.clear()
+                                audio_frames.extend(audio)
+                                # Drain any stale frames from queue
+                                while not audio_queue.empty():
+                                    try:
+                                        audio_queue.get_nowait()
+                                        audio_queue.task_done()
+                                    except (asyncio.QueueEmpty, ValueError):
+                                        break
+                        else:
+                            if energy >= settings.vad_rms_threshold:
+                                speech_active = True
+                                last_speech_time = now
+                            if speech_active:
+                                audio_frames.extend(audio)
+                                if (
+                                    last_speech_time is not None
+                                    and now - last_speech_time >= settings.vad_silence_seconds
+                                    and audio_frames
+                                ):
+                                    is_bot_turn = True
+                                    barge_in_event.clear()
+                                    captured_audio = bytes(audio_frames)
+                                    duration_seconds = len(captured_audio) / (sample_rate * 2)
+                                    _turn_telemetry(
+                                        "[VAD] User stopped speaking (silence detected). "
+                                        f"Audio duration: {duration_seconds:.2f}s",
+                                        call_sid=call_sid,
+                                    )
+                                    utterance_task = asyncio.create_task(
+                                        process_utterance(captured_audio),
+                                        name="sarvam-exotel-loopback",
+                                    )
+                                    logger.info(
+                                        "loopback_utterance_detected",
+                                        extra={"call_sid": call_sid, "event": "loopback"},
+                                    )
                     except Exception as exc:
                         _stage_error("VAD", exc, call_sid=call_sid)
                         audio_frames.clear()
@@ -950,6 +1271,18 @@ async def exotel_stream(websocket: WebSocket) -> None:
                 )
                 if not isinstance(media_format, dict):
                     media_format = {}
+                from_number = (
+                    metadata.get("from")
+                    or metadata.get("From")
+                    or packet.get("from")
+                    or packet.get("From")
+                    or ""
+                )
+                if call_sid:
+                    session = _get_session(call_sid)
+                    if from_number:
+                        session["caller_number"] = from_number
+
                 sample_rate = _sample_rate_from_media_format(media_format)
                 sample_width = _sample_width_from_media_format(media_format)
                 encoding = str(media_format.get("encoding", "audio/x-raw")).lower()
@@ -975,6 +1308,23 @@ async def exotel_stream(websocket: WebSocket) -> None:
                 if outbound_sender and stream_sid:
                     try:
                         await start_idle_keepalive()
+                        # Immediately greet the caller with Turn-0 intake question in default language
+                        greeting_text = _intake_question(0, active_caller_language)
+                        if greeting_text:
+                            try:
+                                greet_wav = await synthesize_speech_sarvam(
+                                    greeting_text,
+                                    target_language_code=active_caller_language,
+                                    speech_sample_rate=sample_rate,
+                                )
+                                greet_pcm = sarvam_audio_to_pcm16(greet_wav, sample_rate)
+                                if greet_pcm:
+                                    await _stream_pcm_to_exotel(
+                                        websocket, stream_sid, greet_pcm, sample_rate, outbound_sender
+                                    )
+                                    print(f"[KAUSHAL VAANI GREETING] Played Turn-0 question in {active_caller_language}", flush=True)
+                            except Exception as greet_exc:
+                                _stage_error("GREETING", greet_exc, call_sid=call_sid)
                     except Exception as exc:
                         # The receive loop remains active even if an outbound
                         # keepalive frame fails during startup.
@@ -985,25 +1335,30 @@ async def exotel_stream(websocket: WebSocket) -> None:
                     logger.warning("invalid_media_packet", extra={"call_sid": call_sid, "event": "media"})
                     continue
                 frames_received += 1
-                if is_bot_turn:
-                    logger.debug(
-                        "caller_audio_discarded_during_bot_turn",
-                        extra={"call_sid": call_sid, "event": "loopback"},
-                    )
-                    continue
                 media_chunk_count += 1
-                await audio_queue.put(
-                    {
-                        "payload": media["payload"],
-                        "sequence": media.get(
-                            "sequence_number",
-                            media.get(
-                                "chunk",
-                                packet.get("sequence_number", packet.get("chunk")),
-                            ),
+                media_item = {
+                    "payload": media["payload"],
+                    "sequence": media.get(
+                        "sequence_number",
+                        media.get(
+                            "chunk",
+                            packet.get("sequence_number", packet.get("chunk")),
                         ),
-                    }
-                )
+                    ),
+                }
+                try:
+                    audio_queue.put_nowait(media_item)
+                except asyncio.QueueFull:
+                    # Drop oldest queued chunk to maintain zero-latency real-time stream
+                    try:
+                        audio_queue.get_nowait()
+                        audio_queue.task_done()
+                    except (asyncio.QueueEmpty, ValueError):
+                        pass
+                    try:
+                        audio_queue.put_nowait(media_item)
+                    except asyncio.QueueFull:
+                        pass
                 if media_chunk_count % 50 == 0:
                     logger.info(
                         "exotel_media_queued",
